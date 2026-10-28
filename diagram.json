@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "author": "Tape Player",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-devkit-c-v4",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-ili9341",
+      "id": "tft",
+      "top": 80,
+      "left": 300,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    ["esp:15", "tft:CS", "green", []],
+    ["esp:2", "tft:D/C", "blue", []],
+    ["esp:13", "tft:MOSI", "orange", []],
+    ["esp:14", "tft:SCK", "yellow", []],
+    ["esp:12", "tft:MISO", "purple", []],
+    ["esp:3V3", "tft:VCC", "red", []],
+    ["esp:GND.1", "tft:GND", "black", []]
+  ]
+}
