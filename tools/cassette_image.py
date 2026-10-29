@@ -1,28 +1,42 @@
 #!/usr/bin/env python3
-"""Converts the cassette photo into main/cassette.bin for the cassette screen.
+"""Converts a photo into an indexed image for main.c: the cassette screen's photos
+(with pre-rotated hubs) and the splash.
 
     sips -s format bmp assets/tdk-d46.jpg --out /tmp/tdk-d46.bmp
-    python3 tools/cassette_image.py /tmp/tdk-d46.bmp main/cassette.bin
+    python3 tools/cassette_image.py tdk-d46 /tmp/tdk-d46.bmp main/cassette-tdk-d46.bin
+    sips -Z 1920 -s format bmp assets/sony-hf60.jpg --out /tmp/sony-hf60.bmp
+    python3 tools/cassette_image.py sony-hf60 /tmp/sony-hf60.bmp main/cassette-sony-hf60.bin
+    sips -s format bmp assets/splash.jpeg --out /tmp/splash.bmp
+    python3 tools/cassette_image.py splash /tmp/splash.bmp main/splash.bin
 
-The input is the 1920 x 1329 photo as a 24-bit BMP; the crop and hub positions
-below are measured on it. Only the standard library is needed.
+The input is the photo as a 24-bit BMP at the size given in PHOTOS; the crop and
+hub positions there are measured on it. Only the standard library is needed.
 
 Output, all integers little-endian uint16:
     first_index, colors, width, height, hub_size, frames,
     left_x, left_y, right_x, right_y     top-left of each hub square in the image
     colors x RGB565                      palette entries first_index onwards
-    width x height bytes                 the cassette as palette indices
+    width x height bytes                 the image as palette indices; 255 = transparent
     frames x (left, right) x hub_size^2  each hub turned anticlockwise by
-                                         360 / frames per frame; 255 = transparent
+                                         360 / frames per frame (none without hubs)
 """
 import math
 import struct
 import sys
 
-CROP = (82, 94, 1754, 1122)  # x, y, width, height of the cassette shell
-HUBS = ((575.8, 606.8), (1338.8, 600.6))  # reel centres
-HUB_RADIUS = 194  # just outside the white sprocket rim
-WIDTH, HEIGHT = 256, 164
+CASSETTE_SIZE = (256, 164)
+PHOTOS = {
+    # 1920 x 1329. The hub radius is just outside the white sprocket rim.
+    'tdk-d46': {'crop': (82, 94, 1754, 1122), 'size': CASSETTE_SIZE,
+                'hubs': ((575.8, 606.8), (1338.8, 600.6)), 'radius': 194},
+    # 1920 x 1230 (scaled from 3131 x 2006), already cropped to the shell. Centres are
+    # on the chrome spline ring; the radius covers the grey hub inside the window.
+    'sony-hf60': {'crop': (0, 0, 1920, 1230), 'size': CASSETTE_SIZE,
+                  'hubs': ((557.0, 563.0), (1364.5, 561.0)), 'radius': 184},
+    # 1408 x 768: the rounded icon. Its white surround becomes transparent so the
+    # screen background shows through.
+    'splash': {'crop': (396, 80, 614, 614), 'size': (200, 200), 'white_transparent': 235},
+}
 FRAMES = 24
 FIRST_INDEX = 7  # main.c's UI colours come first
 TRANSPARENT = 255
@@ -55,14 +69,14 @@ def bilinear(rows, x, y):
                  for i in range(3))
 
 
-def scale_cassette(rows, scale_x, scale_y):
-    """Area-averages the cropped shell down to WIDTH x HEIGHT."""
+def scale_photo(rows, crop, width, height, scale_x, scale_y):
+    """Area-averages the cropped photo down to width x height."""
     image = []
-    for y in range(HEIGHT):
-        top, bottom = CROP[1] + round(y * scale_y), CROP[1] + round((y + 1) * scale_y)
+    for y in range(height):
+        top, bottom = crop[1] + round(y * scale_y), crop[1] + round((y + 1) * scale_y)
         line = []
-        for x in range(WIDTH):
-            left, right = CROP[0] + round(x * scale_x), CROP[0] + round((x + 1) * scale_x)
+        for x in range(width):
+            left, right = crop[0] + round(x * scale_x), crop[0] + round((x + 1) * scale_x)
             total = [0, 0, 0]
             for source in rows[top:bottom]:
                 for pixel in source[left:right]:
@@ -74,12 +88,12 @@ def scale_cassette(rows, scale_x, scale_y):
     return image
 
 
-def render_hub(rows, centre, scale_x, scale_y, angle, size, corner):
+def render_hub(rows, crop, centre, hub_radius, scale_x, scale_y, angle, size, corner):
     """One hub square, rotated anticlockwise on screen; None outside the reel."""
     # Hub centre and radius in output pixels.
-    centre_x = (centre[0] - CROP[0]) / scale_x
-    centre_y = (centre[1] - CROP[1]) / scale_y
-    radius = HUB_RADIUS / scale_x
+    centre_x = (centre[0] - crop[0]) / scale_x
+    centre_y = (centre[1] - crop[1]) / scale_y
+    radius = hub_radius / scale_x
     cos, sin = math.cos(angle), math.sin(angle)
     square = []
     for j in range(size):
@@ -142,22 +156,31 @@ def median_cut(counts, colors):
 
 
 def main():
-    source, target = sys.argv[1], sys.argv[2]
+    if len(sys.argv) != 4 or sys.argv[1] not in PHOTOS:
+        sys.exit(f'usage: {sys.argv[0]} {{{",".join(PHOTOS)}}} photo.bmp output.bin')
+    photo, source, target = PHOTOS[sys.argv[1]], sys.argv[2], sys.argv[3]
+    crop, (width, height) = photo['crop'], photo['size']
     _, _, rows = read_bmp(source)
-    scale_x, scale_y = CROP[2] / WIDTH, CROP[3] / HEIGHT
-    image = scale_cassette(rows, scale_x, scale_y)
+    scale_x, scale_y = crop[2] / width, crop[3] / height
+    image = scale_photo(rows, crop, width, height, scale_x, scale_y)
+    if 'white_transparent' in photo:
+        image = [[None if min(pixel) > photo['white_transparent'] else pixel for pixel in line]
+                 for line in image]
 
-    radius = math.ceil(HUB_RADIUS / scale_x)
-    size = 2 * radius + 1
-    corners = [(round((x - CROP[0]) / scale_x) - radius, round((y - CROP[1]) / scale_y) - radius)
-               for x, y in HUBS]
-    frames = []
-    for frame in range(FRAMES):
-        angle = 2 * math.pi * frame / FRAMES
-        frames.append([render_hub(rows, centre, scale_x, scale_y, angle, size, corner)
-                       for centre, corner in zip(HUBS, corners)])
+    size, corners, frames = 0, [(0, 0), (0, 0)], []
+    if 'hubs' in photo:
+        hubs, hub_radius = photo['hubs'], photo['radius']
+        radius = math.ceil(hub_radius / scale_x)
+        size = 2 * radius + 1
+        corners = [(round((x - crop[0]) / scale_x) - radius, round((y - crop[1]) / scale_y) - radius)
+                   for x, y in hubs]
+        for frame in range(FRAMES):
+            angle = 2 * math.pi * frame / FRAMES
+            frames.append([render_hub(rows, crop, centre, hub_radius, scale_x, scale_y, angle, size,
+                                      corner)
+                           for centre, corner in zip(hubs, corners)])
 
-    pixels = [pixel for line in image for pixel in line]
+    pixels = [pixel for line in image for pixel in line if pixel]
     pixels += [pixel for frame in frames for hub in frame for pixel in hub if pixel]
     counts = {}
     for pixel in pixels:
@@ -178,7 +201,7 @@ def main():
                 key=lambda i: sum((a - b) ** 2 for a, b in zip(rgb, expanded[i])))
         return nearest[color]
 
-    output = struct.pack('<10H', FIRST_INDEX, len(palette), WIDTH, HEIGHT, size, FRAMES,
+    output = struct.pack('<10H', FIRST_INDEX, len(palette), width, height, size, len(frames),
                          *corners[0], *corners[1])
     output += struct.pack(f'<{len(palette)}H', *palette)
     output += bytes(index(pixel) for line in image for pixel in line)

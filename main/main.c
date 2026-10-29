@@ -13,6 +13,7 @@
 #include "driver/i2c_master.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
@@ -47,6 +48,8 @@
 #define CALIBRATION_FILE "/sdcard/calibration.json"
 #define CASSETTE_TOP 18
 #define CASSETTE_TRANSPARENT 255
+#define SPLASH_MS 1000
+#define APP_AUTHOR "NEUROHIDE"
 #define CARD_POLL_MS 1000
 #define PAUSE_BUTTON_LEFT 107
 #define STOP_BUTTON_LEFT 214
@@ -77,6 +80,7 @@ typedef enum { CARD_MISSING, CARD_UNSUPPORTED, CARD_READY } card_state_t;
 static card_state_t card_state;
 static const char *const card_state_names[] = {"missing", "unsupported", "ready"};
 static esp_err_t card_error;
+static char card_label[24]; // FAT volume label of the mounted card, "" if it has none
 static bool flash_mounted;
 static bool builtin_library;
 static const char *library_root = "/sdcard";
@@ -193,8 +197,9 @@ static void image(int left, int top, int width, int height, const uint8_t *pixel
 	}
 }
 
-// main/cassette.bin, made by tools/cassette_image.py. The header is little-endian
-// uint16s; embedded files are not aligned, so it is copied out byte by byte.
+// main/cassette-*.bin and main/splash.bin, made by tools/cassette_image.py. The
+// header is little-endian uint16s; embedded files are not aligned, so it is copied
+// out byte by byte.
 typedef struct {
 	uint16_t first_index;
 	uint16_t colors;
@@ -203,29 +208,52 @@ typedef struct {
 	uint16_t hub_size;
 	uint16_t frames;
 	uint16_t hubs[2][2]; // top-left of the left and right hub squares in the image
-} cassette_header_t;
+} photo_header_t;
 
-extern const uint8_t cassette_bin[] asm("_binary_cassette_bin_start");
-static cassette_header_t cassette;
+extern const uint8_t cassette_tdk_bin[] asm("_binary_cassette_tdk_d46_bin_start");
+extern const uint8_t cassette_sony_bin[] asm("_binary_cassette_sony_hf60_bin_start");
+extern const uint8_t splash_bin[] asm("_binary_splash_bin_start");
+static const uint8_t *const cassette_images[] = {cassette_tdk_bin, cassette_sony_bin};
+#define CASSETTE_IMAGES (sizeof(cassette_images) / sizeof(cassette_images[0]))
+static unsigned tapes_played;
+static photo_header_t cassette;
 static const uint8_t *cassette_pixels;
 static const uint8_t *cassette_hubs; // frames x (left, right) x hub_size^2
 
+static uint16_t lcd_color(uint16_t color)
+{
+	return (color >> 8) | (color << 8);
+}
+
+// Each photo has its own colours, which replace the palette entries after the UI
+// colours; only one photo can be on screen. Returns its pixels. Only the UI task
+// (or app_main before it starts) draws, so this cannot race a flush.
+static const uint8_t *load_photo(const uint8_t *bin, photo_header_t *header)
+{
+	memcpy(header, bin, sizeof(*header));
+	ESP_ERROR_CHECK(header->first_index == UI_COLORS
+					&& header->first_index + header->colors <= CASSETTE_TRANSPARENT
+					? ESP_OK : ESP_ERR_INVALID_VERSION);
+	const uint8_t *colors = bin + sizeof(*header);
+	for (unsigned index = UI_COLORS; index < 256; ++index) {
+		unsigned photo = index - UI_COLORS;
+		lcd_palette[index] = lcd_color(photo < header->colors
+									   ? colors[photo * 2] | colors[photo * 2 + 1] << 8 : INK);
+	}
+	return colors + header->colors * 2;
+}
+
+static void select_cassette(unsigned choice)
+{
+	cassette_pixels = load_photo(cassette_images[choice], &cassette);
+	cassette_hubs = cassette_pixels + cassette.width * cassette.height;
+}
+
 static void palette_init(void)
 {
-	memcpy(&cassette, cassette_bin, sizeof(cassette));
-	ESP_ERROR_CHECK(cassette.first_index == UI_COLORS
-					&& cassette.first_index + cassette.colors <= CASSETTE_TRANSPARENT
-					? ESP_OK : ESP_ERR_INVALID_VERSION);
-	const uint8_t *colors = cassette_bin + sizeof(cassette);
-	for (unsigned index = 0; index < 256; ++index) {
-		uint16_t color = INK;
-		unsigned photo = index - UI_COLORS;
-		if (index < UI_COLORS) color = palette[index];
-		else if (photo < cassette.colors) color = colors[photo * 2] | colors[photo * 2 + 1] << 8;
-		lcd_palette[index] = (color >> 8) | (color << 8);
-	}
-	cassette_pixels = colors + cassette.colors * 2;
-	cassette_hubs = cassette_pixels + cassette.width * cassette.height;
+	for (unsigned index = 0; index < UI_COLORS; ++index) lcd_palette[index] = lcd_color(palette[index]);
+	// Check every photo at startup, then show the first.
+	for (unsigned choice = CASSETTE_IMAGES; choice--;) select_cassette(choice);
 }
 
 static void lcd_command(uint8_t command, const uint8_t *data, size_t length)
@@ -563,7 +591,10 @@ static card_state_t mount_sd(void)
 		type = root.obj.fs->fs_type;
 		f_closedir(&root);
 	}
-	if (type == FS_FAT16 || type == FS_FAT32) return CARD_READY;
+	if (type == FS_FAT16 || type == FS_FAT32) {
+		if (f_getlabel(drive, card_label, NULL) != FR_OK) card_label[0] = 0;
+		return CARD_READY;
+	}
 	esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
 	card_error = ESP_ERR_NOT_SUPPORTED;
 	return CARD_UNSUPPORTED;
@@ -656,7 +687,8 @@ static bool audio_flush(audio_t *audio)
 	return true;
 }
 
-// Feeds silence while paused, so the DAC's DMA ring never replays tape audio.
+// Feeds silence while paused, so the output rests at the midpoint instead of the
+// last pulse level (the DMA simply stops when it runs out of data).
 static bool audio_pause(audio_t *audio)
 {
 	if (!audio_flush(audio)) return false;
@@ -711,6 +743,32 @@ static void playback_progress(long position, long total, unsigned block, void *c
 	portEXIT_CRITICAL(&state_lock);
 }
 
+// The DAC channel is created on the first playback and kept. Deleting and re-creating
+// it lets the DMA end-of-frame interrupt hand a stale descriptor address from the old
+// channel to the new one, which dac_continuous_write then writes through.
+static dac_continuous_handle_t audio_output(void)
+{
+	static dac_continuous_handle_t dac;
+	if (dac) return dac;
+	dac_continuous_config_t config = {
+		.chan_mask = DAC_CHANNEL_MASK_CH1, .desc_num = 8, .buf_size = 2048,
+		.freq_hz = SAMPLE_RATE, .offset = 0,
+		.clk_src = DAC_DIGI_CLK_SRC_DEFAULT, .chan_mode = DAC_CHANNEL_MODE_SIMUL
+	};
+	dac_continuous_handle_t created;
+	esp_err_t error = dac_continuous_new_channels(&config, &created);
+	if (error == ESP_OK) {
+		error = dac_continuous_enable(created);
+		if (error != ESP_OK) dac_continuous_del_channels(created);
+	}
+	if (error != ESP_OK) {
+		ESP_LOGE(TAG, "DAC setup: %s", esp_err_to_name(error));
+		return NULL;
+	}
+	dac = created;
+	return dac;
+}
+
 static void playback_task(void *argument)
 {
 	(void)argument;
@@ -721,40 +779,27 @@ static void playback_task(void *argument)
 	bool tzx = has_extension(files[selected], ".tzx");
 	audio_t *audio = calloc(1, sizeof(*audio));
 	tap_result_t result = file ? TAP_NO_MEMORY : TAP_IO_ERROR;
-	bool enabled = false;
 	bool audio_error = false;
 	if (file && audio) {
-		dac_continuous_config_t config = {
-			.chan_mask = DAC_CHANNEL_MASK_CH1, .desc_num = 8, .buf_size = 2048,
-			.freq_hz = SAMPLE_RATE, .offset = 0,
-			.clk_src = DAC_DIGI_CLK_SRC_DEFAULT, .chan_mode = DAC_CHANNEL_MODE_SIMUL
-		};
-		esp_err_t error = dac_continuous_new_channels(&config, &audio->dac);
-		if (error == ESP_OK) {
-			error = dac_continuous_enable(audio->dac);
-			enabled = error == ESP_OK;
-		}
-		if (enabled) {
+		audio->dac = audio_output();
+		if (audio->dac) {
 			if (tzx) result = tzx_play(file, audio_pulse, playback_progress, tape_stop, audio);
 			else result = (msx ? cas_play : tap_play)(file, audio_pulse, playback_progress, audio);
-			if (!audio->failed && !atomic_load(&cancel_playback)) {
+			if (!audio->failed) {
+				// End on silence: the output keeps the last samples once the DMA runs dry.
+				// A stopped tape drops its unsent pulses.
+				if (atomic_load(&cancel_playback)) audio->used = 0;
 				memset(audio->samples + audio->used, 128, AUDIO_BUFFER - audio->used);
 				audio->used = AUDIO_BUFFER;
 				audio_flush(audio);
-				vTaskDelay(pdMS_TO_TICKS(50));
 			}
 			audio_error = audio->failed;
 		} else {
-			ESP_LOGE(TAG, "DAC setup: %s", esp_err_to_name(error));
 			audio_error = true;
 		}
 	}
 	if (file) fclose(file);
-	if (audio) {
-		if (enabled) dac_continuous_disable(audio->dac);
-		if (audio->dac) dac_continuous_del_channels(audio->dac);
-		free(audio);
-	}
+	free(audio);
 	portENTER_CRITICAL(&state_lock);
 	player.playing = false;
 	snprintf(player.status, sizeof(player.status), "%s",
@@ -805,13 +850,23 @@ static void arrow(int left, int top, bool right, uint16_t color)
 	}
 }
 
+// The header's second line: the volume label of the library being shown.
+static void render_label(void)
+{
+	char label[40];
+	const char *name = builtin_library ? "BUILT-IN" : card_state != CARD_READY ? "-"
+					   : card_label[0] ? card_label : "NO NAME";
+	snprintf(label, sizeof(label), "LABEL: %s", name);
+	text(13, 30, label, 1, GREEN, 32);
+}
+
 static void render_browser(void)
 {
 	char label[48];
 	rect(0, 0, WIDTH, HEIGHT, PAPER);
 	rect(0, 0, WIDTH, 43, INK);
 	text(12, 9, "TAPE LIBRARY", 2, WHITE, 24);
-	text(13, 30, "ZX SPECTRUM / MSX", 1, GREEN, 25);
+	render_label();
 	const char *source = builtin_library ? "FLASH / TAP TZX CAS" : "SD / TAP TZX CAS";
 	text(308 - (int)strlen(source) * 6, 30, source, 1, WHITE, 19);
 	if (!file_count) {
@@ -871,7 +926,7 @@ static void render_card_screen(void)
 	rect(0, 0, WIDTH, HEIGHT, PAPER);
 	rect(0, 0, WIDTH, 43, INK);
 	text(12, 9, "TAPE LIBRARY", 2, WHITE, 24);
-	text(13, 30, "ZX SPECTRUM / MSX", 1, GREEN, 25);
+	render_label();
 	if (missing) sd_card_icon(138, 52);
 	else alert_icon(131, 58);
 	text((WIDTH - (int)strlen(first) * 12) / 2, 122, first, 2, missing ? INK : RED, 26);
@@ -903,7 +958,7 @@ static void render_cassette(unsigned animation)
 	// The photo, with its two hubs overlaid at the current reel angle.
 	int left = (WIDTH - cassette.width) / 2;
 	image(left, CASSETTE_TOP, cassette.width, cassette.height, cassette_pixels);
-	if (moving) reel_frame = (reel_frame + 1) % cassette.frames;
+	reel_frame = (reel_frame + moving) % cassette.frames;
 	size_t hub_bytes = cassette.hub_size * cassette.hub_size;
 	for (unsigned hub = 0; hub < 2; ++hub) {
 		image(left + cassette.hubs[hub][0], CASSETTE_TOP + cassette.hubs[hub][1],
@@ -961,6 +1016,8 @@ static void handle_tap(int screen_x, int screen_y)
 		unsigned index = page * PAGE_ROWS + (screen_y - 50) / 29;
 		if (index < file_count) {
 			selected = index;
+			// Each tape started from the library gets the next cassette photo.
+			select_cassette(tapes_played++ % CASSETTE_IMAGES);
 			start_playback();
 		}
 	}
@@ -1110,14 +1167,30 @@ static void ui_task(void *argument)
 	}
 }
 
+// The splash icon with the version, author and build year under it.
+static void render_splash(void)
+{
+	photo_header_t splash;
+	const uint8_t *pixels = load_photo(splash_bin, &splash);
+	rect(0, 0, WIDTH, HEIGHT, PAPER);
+	image((WIDTH - splash.width) / 2, 8, splash.width, splash.height, pixels);
+	const esp_app_desc_t *app = esp_app_get_description();
+	char label[64];
+	// The build date reads "Mmm dd yyyy".
+	snprintf(label, sizeof(label), "V%s - %s - %s", app->version, APP_AUTHOR, app->date + 7);
+	text((WIDTH - (int)strlen(label) * 6) / 2, 222, label, 1, INK, 50);
+}
+
 void app_main(void)
 {
 	inputs_init();
 	touch_i2c_init();
 	palette_init();
 	display_init();
-	rect(0, 0, WIDTH, HEIGHT, PAPER);
+	// The splash stays up for at least SPLASH_MS while the SD card is mounted.
+	render_splash();
 	display_flush();
+	TickType_t splash_shown = xTaskGetTickCount();
 	spi_bus_config_t sd_bus = {
 		.mosi_io_num = 23, .miso_io_num = 19, .sclk_io_num = 18,
 		.quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 4096
@@ -1136,6 +1209,9 @@ void app_main(void)
 	}
 	card_state = mount_sd();
 	ESP_LOGI(TAG, "SD card %s (%s)", card_state_names[card_state], esp_err_to_name(card_error));
+	TickType_t elapsed = xTaskGetTickCount() - splash_shown;
+	if (elapsed < pdMS_TO_TICKS(SPLASH_MS)) vTaskDelay(pdMS_TO_TICKS(SPLASH_MS) - elapsed);
+	select_cassette(0);
 	if (card_state == CARD_READY) apply_card_calibration();
 	scan_files();
 	ESP_ERROR_CHECK(xTaskCreatePinnedToCore(ui_task, "tape_ui", 6144, NULL, 3, NULL, 1) == pdPASS

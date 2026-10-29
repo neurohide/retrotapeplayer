@@ -74,11 +74,19 @@ select `-O2` and a 240 MHz CPU, mainly to keep full-screen redraws fast.
 - `sdcard/` — sample TAP bundled into flash (the BUILT-IN TAPES library) and
   copied onto the simulator's microSD card.
 - `diagram.json`, `wokwi.toml` — Wokwi simulation setup (see above).
-- `main/cassette.bin` — generated, committed: the playback screen's cassette
-  photo plus 24 pre-rotated frames of each hub, embedded with `EMBED_FILES`.
-  Made from `assets/tdk-d46.jpg` (CC BY 3.0, credited in README) by
-  `tools/cassette_image.py`; README has the regenerate command. The crop/hub
-  constants in the script are measured on that exact photo.
+- `main/cassette-tdk-d46.bin`, `main/cassette-sony-hf60.bin` — generated,
+  committed: the playback screen's cassette photos plus 24 pre-rotated frames
+  of each hub, embedded with `EMBED_FILES`. Made from `assets/*.jpg` by
+  `tools/cassette_image.py` (README has the commands; the Sony source must be
+  scaled to 1920 px first). Crop/hub constants live per photo in its `PHOTOS`
+  table, measured on those exact files. The TDK photo is CC BY 3.0, credited in
+  README; the Sony photo's source/licence is not recorded yet.
+- `main/splash.bin` — generated, committed: the start-up splash icon (200×200,
+  white made transparent) from `assets/splash.jpeg`, same script and format with
+  no hubs. `render_splash()` draws it with `V<PROJECT_VER> - APP_AUTHOR - <build
+  year from esp_app_get_description()>`; `app_main` keeps it up for at least
+  `SPLASH_MS` while mounting the SD card, then calls `select_cassette(0)` to put
+  the cassette colours back before anything else draws.
 
 ## Architecture notes and pitfalls
 
@@ -88,9 +96,13 @@ runs `tap_play` → `audio_pulse` → `dac_continuous_write`, and deletes itself
 Shared `player` state is guarded by the `state_lock` spinlock — read it via
 `player_snapshot()`, write it inside `portENTER/EXIT_CRITICAL`. Stop is the
 atomic `cancel_playback`, checked inside `audio_pulse`; pause is the atomic
-`pause_playback`, where `audio_pause()` keeps writing silence (stopping DAC
-writes would make its DMA ring replay old tape audio). A paused player still
-counts as playing. The playback task reads
+`pause_playback`, where `audio_pause()` keeps writing silence so the output
+rests at the midpoint. A paused player still counts as playing. The DAC channel
+is created once (`audio_output()`) and never deleted: re-creating it made the
+DMA EOF interrupt push a stale descriptor address into the new channel's pool,
+which crashed `dac_continuous_write` on the second playback. Each playback ends
+by writing one silence buffer, since the output keeps its last samples once the
+DMA runs dry. The playback task reads
 `files[selected]` and `library_root` directly, so nothing may rescan or change
 the selection while playing (the browser is only reachable once playback has
 stopped).
@@ -111,11 +123,15 @@ functions take RGB565 colors and `rect()` looks them up in `palette[]` (the 7 UI
 colors). A color not in `palette[]` silently draws as index 0 (`INK`) — add new
 colors to both the `#define`s and `palette[]`. Indices 7–254 are the cassette
 photo's colors and 255 is transparent; `palette_init()` builds the byte-swapped
-`lcd_palette[256]` that `display_flush()` uses. Adding a UI color shifts the
-photo's indices, so regenerate `cassette.bin` with a matching `FIRST_INDEX`
-(`palette_init()` aborts on a mismatch). `rect()` clips; `image()` does not.
-`cassette.bin` is not aligned in flash: read it with `memcpy`/bytes, never by
-casting to `uint16_t *`.
+`lcd_palette[256]` that `display_flush()` uses, and `select_cassette()` swaps in
+a photo's colors (indices 7+) and pointers via `load_photo()`; only one photo
+(a cassette or the splash) can be on screen at a time. It is called only from the UI task
+(on each library tap, `tapes_played` alternates the photos), so it cannot race
+a flush. Adding a UI color shifts the photos' indices, so regenerate every
+`cassette-*.bin` with a matching `FIRST_INDEX` (`palette_init()` checks all of
+them at boot and aborts on a mismatch). `rect()` clips; `image()` does not.
+The `.bin` files are not aligned in flash: read them with `memcpy`/bytes, never
+by casting to `uint16_t *`.
 
 **Font** covers only A–Z, 0–9, space and `. : - _ / %`; lowercase is
 uppercased and anything else renders as `?`. Glyph cells are 6 px × scale wide.
@@ -139,6 +155,9 @@ else, or a volume that is not FAT16/FAT32) or READY; the first two show
 slot, remove the `sd1` part from a copy of `diagram.json` and pass it with
 `wokwi-cli --diagram-file`. The built-in library mounts read-only at `/flash`. Only
 regular, non-dot `.tap`, `.tzx` and `.cas` files in the root are listed (max 96, case-insensitive sort).
+`mount_sd()` also reads the volume label into `card_label` with `f_getlabel`,
+which needs `CONFIG_FATFS_USE_LABEL=y` (in `sdkconfig.defaults`);
+`render_label()` shows it under the header title.
 `calibration.json` is read/written only on the SD card: `apply_card_calibration()`
 runs whenever a card becomes READY (startup or `update_card()`), loading the file
 or running `calibrate_touch()` (XPT2046 only) and saving it. No card means no

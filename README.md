@@ -5,6 +5,11 @@ ILI9341 / XPT2046 "Cheap Yellow Display"), using ESP-IDF 5.4.
 
 ## Use
 
+At power-on the board shows the RetroTape Player splash with the app version,
+author and build year for at least one second while it reads the SD card. The
+version is `PROJECT_VER` in the top-level `CMakeLists.txt`; the author is
+`APP_AUTHOR` in `main/main.c`.
+
 1. Format a microSD card as **FAT16 or FAT32** and put ZX Spectrum `.tap` or
 	`.tzx` files, or MSX `.cas` files, in its root directory. Without a card the board shows **PLEASE INSERT AN SD
 	CARD**; the card can be inserted at any time.
@@ -15,7 +20,8 @@ ILI9341 / XPT2046 "Cheap Yellow Display"), using ESP-IDF 5.4.
 	filename, skipping hidden ones whose names start with `.` (such as the `._`
 	files macOS creates). Touch a row to hide the library and start playback immediately.
 4. The playback screen shows a photo of a cassette with the selected filename
-	above it. Its reels turn while playing; the progress bar and block number
+	above it; each tape started from the library alternates between a TDK D46
+	and a Sony HF60 (**REPLAY** keeps the current one). Its reels turn while playing; the progress bar and block number
 	update during playback.
 5. Touch **PAUSE** to hold the tape where it is (the output goes silent) and
 	**RESUME** to continue, the square to stop, the triangle to replay from the
@@ -42,7 +48,9 @@ before removing a card.
 **BUILT-IN TAPES** on either screen opens a read-only FAT partition in flash
 (`storage` in `partitions.csv`), built from the `sdcard/` folder and written
 with the firmware; inserting a card switches to it. The header shows `SD / TAP TZX CAS`
-or `FLASH / TAP TZX CAS` for the active source. The board needs 4 MB of flash.
+or `FLASH / TAP TZX CAS` for the active source, and under the title
+`LABEL:` with the card's FAT volume label (`NO NAME` if it has none,
+`BUILT-IN` for the flash library, `-` without a usable card). The board needs 4 MB of flash.
 
 ## Board Connections
 
@@ -160,24 +168,42 @@ The simulator has no speaker, and it reports task watchdog warnings for
 `tap_audio` during playback. The XPT2046 touch path, actual DAC playback, and
 real Spectrum loading must be checked on physical hardware.
 
-## Cassette Photo
+## Cassette Photos
 
-The playback screen uses "TDK D46 audio cassette" by Hannes Grobe/AWI,
-[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/), from
-[Wikimedia Commons](https://commons.wikimedia.org/wiki/File:TDK_D46_audio_cassette.jpg).
-The source is `assets/tdk-d46.jpg`. `tools/cassette_image.py` crops it to the
-shell, scales it to 256 × 164, reduces it to 248 colours, and pre-renders 24
-rotations of each hub into `main/cassette.bin`, which is embedded in the
-firmware. To regenerate it (macOS `sips` converts the JPEG; the script needs only
-Python):
+The playback screen alternates between two photos:
+
+- `assets/tdk-d46.jpg`: "TDK D46 audio cassette" by Hannes Grobe/AWI,
+  [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/), from
+  [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:TDK_D46_audio_cassette.jpg).
+- `assets/sony-hf60.jpg`: a Sony HF60 cassette. Its source and licence are not
+  recorded yet.
+
+`tools/cassette_image.py` crops a photo to the shell, scales it to 256 × 164,
+reduces it to 248 colours, and pre-renders 24 rotations of each hub into
+`main/cassette-<photo>.bin`, which is embedded in the firmware. Each photo has
+its own colours; the firmware swaps them into the display palette when the
+cassette changes. To regenerate (macOS `sips` converts the JPEG; the script
+needs only Python):
 
 ```sh
 sips -s format bmp assets/tdk-d46.jpg --out /tmp/tdk-d46.bmp
-python3 tools/cassette_image.py /tmp/tdk-d46.bmp main/cassette.bin
+python3 tools/cassette_image.py tdk-d46 /tmp/tdk-d46.bmp main/cassette-tdk-d46.bin
+sips -Z 1920 -s format bmp assets/sony-hf60.jpg --out /tmp/sony-hf60.bmp
+python3 tools/cassette_image.py sony-hf60 /tmp/sony-hf60.bmp main/cassette-sony-hf60.bin
 ```
 
-The crop and hub positions in the script are measured on this photo; a different
-photo needs new values.
+The same script makes the splash, `main/splash.bin`, from `assets/splash.jpeg`:
+it crops the rounded icon, scales it to 200 × 200 and makes its white surround
+transparent.
+
+```sh
+sips -s format bmp assets/splash.jpeg --out /tmp/splash.bmp
+python3 tools/cassette_image.py splash /tmp/splash.bmp main/splash.bin
+```
+
+The crop and hub positions in the script's `PHOTOS` table are measured on these
+photos at those sizes; another photo needs its own entry, a new `.bin` in
+`EMBED_FILES`, and an entry in `cassette_images[]` in `main.c`.
 
 ## Decoder Tests
 
