@@ -2,3 +2,7 @@
 version = 1
 firmware = 'build/flasher_args.json'
 elf = 'build/tape_player.elf'
+
+# The simulated microSD card is filled from sdcard/ at every start. Leave
+# write-back off: it mirrors the card as it was when the simulation started,
+# deleting files added to sdcard/ while it ran.

@@ -3,17 +3,35 @@
   "author": "Tape Player",
   "editor": "wokwi",
   "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
     {
-      "type": "board-esp32-2432s028r",
-      "id": "esp",
-      "top": 0,
-      "left": 0,
-      "rotate": 180,
+      "type": "board-ili9341-cap-touch",
+      "id": "lcd1",
+      "top": -60,
+      "left": 160,
+      "rotate": 90,
       "attrs": {}
-    }
+    },
+    { "type": "wokwi-microsd-card", "id": "sd1", "top": 240, "left": 170, "attrs": {} }
   ],
   "connections": [
-    ["esp:TX", "$serialMonitor:RX", "", []],
-    ["esp:RX", "$serialMonitor:TX", "", []]
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "lcd1:VCC", "esp:3V3", "red", [] ],
+    [ "lcd1:GND", "esp:GND.2", "black", [] ],
+    [ "lcd1:CS", "esp:15", "orange", [] ],
+    [ "lcd1:D/C", "esp:2", "violet", [] ],
+    [ "lcd1:MOSI", "esp:13", "blue", [] ],
+    [ "lcd1:SCK", "esp:14", "yellow", [] ],
+    [ "lcd1:MISO", "esp:12", "green", [] ],
+    [ "lcd1:LED", "esp:21", "white", [] ],
+    [ "lcd1:SCL", "esp:22", "gray", [] ],
+    [ "lcd1:SDA", "esp:27", "cyan", [] ],
+    [ "sd1:VCC", "esp:3V3", "red", [] ],
+    [ "sd1:GND", "esp:GND.3", "black", [] ],
+    [ "sd1:CS", "esp:5", "orange", [] ],
+    [ "sd1:DI", "esp:23", "blue", [] ],
+    [ "sd1:DO", "esp:19", "green", [] ],
+    [ "sd1:SCK", "esp:18", "yellow", [] ]
   ]
 }

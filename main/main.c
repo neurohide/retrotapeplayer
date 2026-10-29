@@ -10,15 +10,19 @@
 #include "cJSON.h"
 #include "driver/dac_continuous.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "esp_vfs_fat.h"
+#include "diskio_sdmmc.h" // after esp_vfs_fat.h, which defines BYTE
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "cas.h"
 #include "tap.h"
+#include "tzx.h"
 
 #define WIDTH 320
 #define HEIGHT 240
@@ -37,7 +41,15 @@
 #define TOUCH_MOSI GPIO_NUM_32
 #define TOUCH_MISO GPIO_NUM_39
 #define TOUCH_IRQ GPIO_NUM_36
+#define TOUCH_SDA GPIO_NUM_27
+#define TOUCH_SCL GPIO_NUM_22
+#define FT6206_ADDRESS 0x38
 #define CALIBRATION_FILE "/sdcard/calibration.json"
+#define CASSETTE_TOP 18
+#define CASSETTE_TRANSPARENT 255
+#define CARD_POLL_MS 1000
+#define PAUSE_BUTTON_LEFT 107
+#define STOP_BUTTON_LEFT 214
 
 #define INK 0x18e3
 #define PAPER 0xef5b
@@ -49,21 +61,29 @@
 
 static const char *TAG = "tape";
 static spi_device_handle_t display;
-static spi_device_handle_t touch_spi;
+static i2c_master_dev_handle_t touch_i2c;
 static uint8_t *frame;
 static uint16_t *stripe;
 static const uint16_t palette[] = {INK, PAPER, WHITE, MUTED, GREEN, RED, YELLOW};
+#define UI_COLORS (sizeof(palette) / sizeof(palette[0]))
+// Byte-swapped for the LCD: UI colours, then the cassette photo's colours.
+static uint16_t lcd_palette[256];
 static char files[MAX_FILES][NAME_SIZE];
 static unsigned file_count;
 static unsigned selected;
 static unsigned page;
 static bool truncated_list;
-static bool sd_mounted;
+typedef enum { CARD_MISSING, CARD_UNSUPPORTED, CARD_READY } card_state_t;
+static card_state_t card_state;
+static const char *const card_state_names[] = {"missing", "unsupported", "ready"};
+static esp_err_t card_error;
 static bool flash_mounted;
+static bool builtin_library;
 static const char *library_root = "/sdcard";
 static bool cassette_view;
 static sdmmc_card_t *sd_card;
 static atomic_bool cancel_playback;
+static atomic_bool pause_playback;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // screen = coefficient[0] * raw_x + coefficient[1] * raw_y + coefficient[2]
@@ -162,31 +182,50 @@ static void text(int left, int top, const char *value, int scale, uint16_t color
 	}
 }
 
-static void line(int x_start, int y_start, int x_end, int y_end, uint16_t color)
+// Copies palette indices into the frame, skipping transparent ones. No clipping.
+static void image(int left, int top, int width, int height, const uint8_t *pixels)
 {
-	int delta_x = abs(x_end - x_start);
-	int step_x = x_start < x_end ? 1 : -1;
-	int delta_y = -abs(y_end - y_start);
-	int step_y = y_start < y_end ? 1 : -1;
-	int error = delta_x + delta_y;
-	for (;;) {
-		rect(x_start, y_start, 1, 1, color);
-		if (x_start == x_end && y_start == y_end) break;
-		int doubled = 2 * error;
-		if (doubled >= delta_y) { error += delta_y; x_start += step_x; }
-		if (doubled <= delta_x) { error += delta_x; y_start += step_y; }
+	for (int row = 0; row < height; ++row) {
+		for (int column = 0; column < width; ++column) {
+			uint8_t index = pixels[row * width + column];
+			if (index != CASSETTE_TRANSPARENT) frame[(top + row) * WIDTH + left + column] = index;
+		}
 	}
 }
 
-static void disc(int center_x, int center_y, int radius, uint16_t color)
+// main/cassette.bin, made by tools/cassette_image.py. The header is little-endian
+// uint16s; embedded files are not aligned, so it is copied out byte by byte.
+typedef struct {
+	uint16_t first_index;
+	uint16_t colors;
+	uint16_t width;
+	uint16_t height;
+	uint16_t hub_size;
+	uint16_t frames;
+	uint16_t hubs[2][2]; // top-left of the left and right hub squares in the image
+} cassette_header_t;
+
+extern const uint8_t cassette_bin[] asm("_binary_cassette_bin_start");
+static cassette_header_t cassette;
+static const uint8_t *cassette_pixels;
+static const uint8_t *cassette_hubs; // frames x (left, right) x hub_size^2
+
+static void palette_init(void)
 {
-	for (int row = -radius; row <= radius; ++row) {
-		for (int column = -radius; column <= radius; ++column) {
-			if (row * row + column * column <= radius * radius) {
-				rect(center_x + column, center_y + row, 1, 1, color);
-			}
-		}
+	memcpy(&cassette, cassette_bin, sizeof(cassette));
+	ESP_ERROR_CHECK(cassette.first_index == UI_COLORS
+					&& cassette.first_index + cassette.colors <= CASSETTE_TRANSPARENT
+					? ESP_OK : ESP_ERR_INVALID_VERSION);
+	const uint8_t *colors = cassette_bin + sizeof(cassette);
+	for (unsigned index = 0; index < 256; ++index) {
+		uint16_t color = INK;
+		unsigned photo = index - UI_COLORS;
+		if (index < UI_COLORS) color = palette[index];
+		else if (photo < cassette.colors) color = colors[photo * 2] | colors[photo * 2 + 1] << 8;
+		lcd_palette[index] = (color >> 8) | (color << 8);
 	}
+	cassette_pixels = colors + cassette.colors * 2;
+	cassette_hubs = cassette_pixels + cassette.width * cassette.height;
 }
 
 static void lcd_command(uint8_t command, const uint8_t *data, size_t length)
@@ -248,10 +287,8 @@ static void display_flush(void)
 	lcd_command(0x2c, NULL, 0);
 	gpio_set_level(LCD_DC, 1);
 	for (int row = 0; row < HEIGHT; row += 16) {
-		for (int index = 0; index < WIDTH * 16; ++index) {
-			uint16_t color = palette[frame[row * WIDTH + index]];
-			stripe[index] = (color >> 8) | (color << 8);
-		}
+		const uint8_t *source = frame + row * WIDTH;
+		for (int index = 0; index < WIDTH * 16; ++index) stripe[index] = lcd_palette[source[index]];
 		spi_transaction_t transaction = {.length = WIDTH * 16 * 16, .tx_buffer = stripe};
 		ESP_ERROR_CHECK(spi_device_polling_transmit(display, &transaction));
 	}
@@ -272,37 +309,32 @@ static void inputs_init(void)
 	ESP_ERROR_CHECK(gpio_config(&inputs));
 }
 
-// Without a microSD card the SD SPI host is idle, so touch moves onto it. Wokwi's
-// XPT2046 model only answers the SPI peripheral, not bit-banged GPIO.
-static void touch_use_spi_host(void)
+// An FT6206 capacitive controller on the CN1 I2C connector replaces the XPT2046
+// when it answers. Wokwi's board part never drives the XPT2046 outputs, so the
+// simulator diagram uses Wokwi's ILI9341 + FT6206 display instead.
+static void touch_i2c_init(void)
 {
-	esp_err_t result = spi_bus_free(SPI3_HOST);
-	if (result != ESP_OK) {
-		ESP_LOGW(TAG, "Touch keeps software SPI: %s", esp_err_to_name(result));
+	i2c_master_bus_config_t bus = {
+		.i2c_port = I2C_NUM_0, .sda_io_num = TOUCH_SDA, .scl_io_num = TOUCH_SCL,
+		.clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7,
+		.flags.enable_internal_pullup = true
+	};
+	i2c_master_bus_handle_t handle;
+	if (i2c_new_master_bus(&bus, &handle) != ESP_OK) return;
+	if (i2c_master_probe(handle, FT6206_ADDRESS, 50) != ESP_OK) {
+		i2c_del_master_bus(handle);
 		return;
 	}
-	spi_bus_config_t bus = {
-		.mosi_io_num = TOUCH_MOSI, .miso_io_num = TOUCH_MISO, .sclk_io_num = TOUCH_CLK,
-		.quadwp_io_num = -1, .quadhd_io_num = -1
+	i2c_device_config_t device = {
+		.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = FT6206_ADDRESS,
+		.scl_speed_hz = 400000
 	};
-	ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus, SPI_DMA_DISABLED));
-	spi_device_interface_config_t device = {
-		.clock_speed_hz = 2000000, .spics_io_num = TOUCH_CS, .queue_size = 1
-	};
-	ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST, &device, &touch_spi));
-	ESP_LOGI(TAG, "Touch uses the SPI3 host");
+	ESP_ERROR_CHECK(i2c_master_bus_add_device(handle, &device, &touch_i2c));
+	ESP_LOGI(TAG, "Touch uses the FT6206");
 }
 
 static unsigned touch_read(uint8_t command)
 {
-	if (touch_spi) {
-		spi_transaction_t transaction = {
-			.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA, .length = 24,
-			.tx_data = {command}
-		};
-		ESP_ERROR_CHECK(spi_device_polling_transmit(touch_spi, &transaction));
-		return ((transaction.rx_data[1] << 8 | transaction.rx_data[2]) >> 3) & 4095;
-	}
 	gpio_set_level(TOUCH_CS, 0);
 	for (unsigned bit = 0; bit < 8; ++bit) {
 		gpio_set_level(TOUCH_MOSI, (command >> (7 - bit)) & 1);
@@ -334,14 +366,25 @@ typedef struct {
 
 static touch_inputs_t touch_inputs(void)
 {
+	if (touch_i2c) {
+		// TD_STATUS, P1_XH, P1_XL, P1_YH, P1_YL. The FT6206 has no pressure and keeps
+		// the last point after release, so report zero pressure and TD_STATUS as PENIRQ.
+		uint8_t reg = 0x02;
+		uint8_t data[5] = {0};
+		bool read = i2c_master_transmit_receive(touch_i2c, &reg, 1, data, sizeof(data), 50) == ESP_OK;
+		return (touch_inputs_t){
+			.irq = !(read && (data[0] & 0x0f)), .z2 = 4095, .x = (data[1] & 0x0f) << 8 | data[2],
+			.y = (data[3] & 0x0f) << 8 | data[4]
+		};
+	}
 	return (touch_inputs_t){
 		.irq = gpio_get_level(TOUCH_IRQ), .z1 = touch_read(0xb0), .z2 = touch_read(0xc0),
 		.x = touch_read(0xd0), .y = touch_read(0x90)
 	};
 }
 
-// A press is PENIRQ low or enough pressure, so it works whichever of the two
-// the Wokwi model drives.
+// A press is PENIRQ low or enough pressure, so a missing or noisy PENIRQ line
+// does not prevent touch.
 static bool touch_inputs_pressed(const touch_inputs_t *inputs)
 {
 	bool pressed = !inputs->irq || inputs->z1 + 4095 - inputs->z2 >= TOUCH_PRESSURE;
@@ -496,10 +539,11 @@ static bool save_calibration(const float raw[3][2])
 	return ok;
 }
 
-static bool mount_sd(void)
+// Mounts the card when one answers and keeps it only if it holds a FAT16 or FAT32
+// volume. An empty slot times out or answers garbage to the first commands; any
+// other failure is a card that answers but cannot be used (no FAT volume, exFAT).
+static card_state_t mount_sd(void)
 {
-	if (sd_mounted) return true;
-	if (touch_spi) return false;
 	sdmmc_host_t host = SDSPI_HOST_DEFAULT();
 	host.slot = SPI3_HOST;
 	host.max_freq_khz = 10000;
@@ -509,13 +553,20 @@ static bool mount_sd(void)
 	esp_vfs_fat_mount_config_t mount = {
 		.format_if_mount_failed = false, .max_files = 4, .allocation_unit_size = 16384
 	};
-	esp_err_t result = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mount, &sd_card);
-	if (result != ESP_OK) {
-		ESP_LOGW(TAG, "SD mount: %s", esp_err_to_name(result));
-		return false;
+	card_error = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mount, &sd_card);
+	if (card_error == ESP_ERR_TIMEOUT || card_error == ESP_ERR_INVALID_RESPONSE) return CARD_MISSING;
+	if (card_error != ESP_OK) return CARD_UNSUPPORTED;
+	char drive[] = {'0' + ff_diskio_get_pdrv_card(sd_card), ':', '/', 0};
+	FF_DIR root;
+	BYTE type = 0;
+	if (f_opendir(&root, drive) == FR_OK) {
+		type = root.obj.fs->fs_type;
+		f_closedir(&root);
 	}
-	sd_mounted = true;
-	return true;
+	if (type == FS_FAT16 || type == FS_FAT32) return CARD_READY;
+	esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
+	card_error = ESP_ERR_NOT_SUPPORTED;
+	return CARD_UNSUPPORTED;
 }
 
 static bool mount_flash(void)
@@ -531,6 +582,12 @@ static bool mount_flash(void)
 	return true;
 }
 
+static bool has_extension(const char *name, const char *extension)
+{
+	size_t length = strlen(name);
+	return length > 4 && !strcasecmp(name + length - 4, extension);
+}
+
 static int compare_names(const void *left, const void *right)
 {
 	return strcasecmp(left, right);
@@ -542,21 +599,18 @@ static void scan_files(void)
 	page = 0;
 	selected = 0;
 	truncated_list = false;
-	if (mount_sd()) library_root = "/sdcard";
-	else if (mount_flash()) library_root = "/flash";
+	if (builtin_library) library_root = "/flash";
+	else if (card_state == CARD_READY) library_root = "/sdcard";
 	else return;
 	DIR *directory = opendir(library_root);
-	if (!directory) {
-		if (sd_mounted) {
-			esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
-			sd_mounted = false;
-		}
-		return;
-	}
+	if (!directory) return;
 	struct dirent *entry;
 	while ((entry = readdir(directory))) {
 		size_t length = strlen(entry->d_name);
-		if (length < 5 || length >= NAME_SIZE || strcasecmp(entry->d_name + length - 4, ".tap")) {
+		// Dot files are hidden, such as the "._NAME.tap" metadata macOS writes to cards.
+		if (entry->d_name[0] == '.' || length >= NAME_SIZE
+			|| !(has_extension(entry->d_name, ".tap") || has_extension(entry->d_name, ".tzx")
+				 || has_extension(entry->d_name, ".cas"))) {
 			continue;
 		}
 		char path[NAME_SIZE + 9];
@@ -571,6 +625,13 @@ static void scan_files(void)
 	}
 	closedir(directory);
 	qsort(files, file_count, sizeof(files[0]), compare_names);
+}
+
+static void open_builtin_library(void)
+{
+	if (!mount_flash()) return;
+	builtin_library = true;
+	scan_files();
 }
 
 typedef struct {
@@ -595,6 +656,20 @@ static bool audio_flush(audio_t *audio)
 	return true;
 }
 
+// Feeds silence while paused, so the DAC's DMA ring never replays tape audio.
+static bool audio_pause(audio_t *audio)
+{
+	if (!audio_flush(audio)) return false;
+	while (atomic_load(&pause_playback)) {
+		if (atomic_load(&cancel_playback)) return false;
+		memset(audio->samples, 128, AUDIO_BUFFER);
+		audio->used = AUDIO_BUFFER;
+		if (!audio_flush(audio)) return false;
+		vTaskDelay(1);
+	}
+	return true;
+}
+
 static bool audio_pulse(uint32_t tstates, bool silence, void *context)
 {
 	audio_t *audio = context;
@@ -611,9 +686,20 @@ static bool audio_pulse(uint32_t tstates, bool silence, void *context)
 		count -= chunk;
 		if (audio->used == AUDIO_BUFFER && !audio_flush(audio)) return false;
 		if (atomic_load(&cancel_playback)) return false;
+		if (atomic_load(&pause_playback) && !audio_pause(audio)) return false;
 	}
 	audio->high = silence ? false : !audio->high;
 	return true;
+}
+
+// A TZX "stop the tape" block pauses playback until RESUME, like a real recorder.
+static bool tape_stop(void *context)
+{
+	atomic_store(&pause_playback, true);
+	portENTER_CRITICAL(&state_lock);
+	strcpy(player.status, "TAPE STOP - PRESS RESUME");
+	portEXIT_CRITICAL(&state_lock);
+	return audio_pause(context);
 }
 
 static void playback_progress(long position, long total, unsigned block, void *context)
@@ -631,6 +717,8 @@ static void playback_task(void *argument)
 	char path[NAME_SIZE + 9];
 	snprintf(path, sizeof(path), "%s/%s", library_root, files[selected]);
 	FILE *file = fopen(path, "rb");
+	bool msx = has_extension(files[selected], ".cas");
+	bool tzx = has_extension(files[selected], ".tzx");
 	audio_t *audio = calloc(1, sizeof(*audio));
 	tap_result_t result = file ? TAP_NO_MEMORY : TAP_IO_ERROR;
 	bool enabled = false;
@@ -647,7 +735,8 @@ static void playback_task(void *argument)
 			enabled = error == ESP_OK;
 		}
 		if (enabled) {
-			result = tap_play(file, audio_pulse, playback_progress, audio);
+			if (tzx) result = tzx_play(file, audio_pulse, playback_progress, tape_stop, audio);
+			else result = (msx ? cas_play : tap_play)(file, audio_pulse, playback_progress, audio);
 			if (!audio->failed && !atomic_load(&cancel_playback)) {
 				memset(audio->samples + audio->used, 128, AUDIO_BUFFER - audio->used);
 				audio->used = AUDIO_BUFFER;
@@ -669,7 +758,8 @@ static void playback_task(void *argument)
 	portENTER_CRITICAL(&state_lock);
 	player.playing = false;
 	snprintf(player.status, sizeof(player.status), "%s",
-			 audio_error ? "AUDIO OUTPUT ERROR" : tap_result_text(result));
+			 audio_error ? "AUDIO OUTPUT ERROR" : msx ? cas_result_text(result)
+			 : tzx ? tzx_result_text(result) : tap_result_text(result));
 	portEXIT_CRITICAL(&state_lock);
 	vTaskDelete(NULL);
 }
@@ -686,6 +776,7 @@ static void start_playback(void)
 {
 	if (!file_count || player_snapshot().playing) return;
 	atomic_store(&cancel_playback, false);
+	atomic_store(&pause_playback, false);
 	cassette_view = true;
 	portENTER_CRITICAL(&state_lock);
 	player = (player_state_t){.playing = true, .status = "PLAYING"};
@@ -696,6 +787,15 @@ static void start_playback(void)
 		strcpy(player.status, "NOT ENOUGH MEMORY");
 		portEXIT_CRITICAL(&state_lock);
 	}
+}
+
+static void toggle_pause(void)
+{
+	bool paused = !atomic_load(&pause_playback);
+	atomic_store(&pause_playback, paused);
+	portENTER_CRITICAL(&state_lock);
+	if (player.playing) strcpy(player.status, paused ? "PAUSED" : "PLAYING");
+	portEXIT_CRITICAL(&state_lock);
 }
 
 static void arrow(int left, int top, bool right, uint16_t color)
@@ -711,11 +811,12 @@ static void render_browser(void)
 	rect(0, 0, WIDTH, HEIGHT, PAPER);
 	rect(0, 0, WIDTH, 43, INK);
 	text(12, 9, "TAPE LIBRARY", 2, WHITE, 24);
-	text(13, 30, "ZX SPECTRUM", 1, GREEN, 25);
-	text(249, 30, sd_mounted ? "SD / TAP" : "FLASH / TAP", 1, WHITE, 11);
+	text(13, 30, "ZX SPECTRUM / MSX", 1, GREEN, 25);
+	const char *source = builtin_library ? "FLASH / TAP TZX CAS" : "SD / TAP TZX CAS";
+	text(308 - (int)strlen(source) * 6, 30, source, 1, WHITE, 19);
 	if (!file_count) {
-		text(24, 83, sd_mounted ? "NO TAP FILES" : "SD NOT READY", 2, INK, 23);
-		text(24, 116, sd_mounted ? "ROOT / *.TAP" : "FAT32 MICROSD", 1, INK, 40);
+		text(24, 83, "NO TAPE FILES", 2, INK, 23);
+		text(24, 116, "ROOT / *.TAP *.TZX *.CAS", 1, INK, 40);
 	}
 	for (unsigned row = 0; row < PAGE_ROWS; ++row) {
 		unsigned index = page * PAGE_ROWS + row;
@@ -723,7 +824,7 @@ static void render_browser(void)
 		int top = 50 + row * 29;
 		bool active = selected == index;
 		rect(8, top, 304, 26, active ? INK : WHITE);
-		text(15, top + 9, "TAP", 1, active ? GREEN : INK, 3);
+		text(15, top + 9, files[index] + strlen(files[index]) - 3, 1, active ? GREEN : INK, 3);
 		size_t length = strlen(files[index]);
 		size_t name_length = length - 4;
 		char name[38];
@@ -744,57 +845,71 @@ static void render_browser(void)
 	if (truncated_list) text(211, 217, "96 MAX", 1, YELLOW, 8);
 }
 
-static void reel(int center_x, unsigned phase)
+static void sd_card_icon(int left, int top)
 {
-	static const int offsets[8][2] = {
-		{0,-14}, {10,-10}, {14,0}, {10,10}, {0,14}, {-10,10}, {-14,0}, {-10,-10}
-	};
-	disc(center_x, 119, 26, INK);
-	disc(center_x, 119, 18, PAPER);
-	for (unsigned spoke = 0; spoke < 4; ++spoke) {
-		unsigned index = (phase + spoke * 2) % 8;
-		line(center_x, 119, center_x + offsets[index][0], 119 + offsets[index][1], INK);
-	}
-	disc(center_x, 119, 6, INK);
-	disc(center_x, 119, 2, MUTED);
+	// 44 x 58 with the top-right corner cut off, gold contacts and an SD label.
+	for (int row = 0; row < 58; ++row) rect(left, top + row, row < 12 ? 32 + row : 44, 1, INK);
+	for (int contact = 0; contact < 5; ++contact) rect(left + 5 + contact * 7, top + 6, 4, 12, YELLOW);
+	text(left + 11, top + 38, "SD", 2, WHITE, 2);
+}
+
+static void alert_icon(int left, int top)
+{
+	// A 58 x 50 warning triangle with an exclamation mark.
+	for (int row = 0; row < 50; ++row) rect(left + 28 - row * 29 / 50, top + row, row * 58 / 50 + 2, 1, RED);
+	rect(left + 26, top + 15, 6, 20, WHITE);
+	rect(left + 26, top + 39, 6, 6, WHITE);
+}
+
+// Shown instead of the library while no usable card is mounted.
+static void render_card_screen(void)
+{
+	bool missing = card_state == CARD_MISSING;
+	const char *first = missing ? "PLEASE INSERT" : "CHECK THE SD CARD";
+	const char *second = missing ? "AN SD CARD" : "AND REINSERT";
+	const char *hint = missing ? "FAT16/FAT32 WITH TAP TZX CAS FILES" : "IT MUST BE FAT16 OR FAT32";
+	rect(0, 0, WIDTH, HEIGHT, PAPER);
+	rect(0, 0, WIDTH, 43, INK);
+	text(12, 9, "TAPE LIBRARY", 2, WHITE, 24);
+	text(13, 30, "ZX SPECTRUM / MSX", 1, GREEN, 25);
+	if (missing) sd_card_icon(138, 52);
+	else alert_icon(131, 58);
+	text((WIDTH - (int)strlen(first) * 12) / 2, 122, first, 2, missing ? INK : RED, 26);
+	text((WIDTH - (int)strlen(second) * 12) / 2, 142, second, 2, missing ? INK : RED, 26);
+	text((WIDTH - (int)strlen(hint) * 6) / 2, 172, hint, 1, MUTED, 40);
+	rect(0, 202, WIDTH, 38, INK);
+	text(118, 217, "BUILT-IN TAPES", 1, GREEN, 14);
 }
 
 static void render_cassette(unsigned animation)
 {
+	static unsigned reel_frame;
 	player_state_t state = player_snapshot();
+	bool paused = state.playing && atomic_load(&pause_playback);
+	bool moving = state.playing && !paused;
 	char label[48];
 	rect(0, 0, WIDTH, HEIGHT, PAPER);
-	text(14, 11, "ZX SPECTRUM", 1, INK, 22);
-	text(227, 11, "TAPE / 48K", 1, INK, 15);
-	rect(15, 32, 290, 146, INK);
-	rect(20, 37, 280, 136, MUTED);
-	rect(29, 44, 262, 44, PAPER);
-	rect(29, 44, 5, 44, RED);
 	size_t length = strlen(files[selected]);
-	if (length <= 40) text(41, 58, files[selected], 1, INK, 40);
+	if (length <= 50) text(10, 6, files[selected], 1, INK, 50);
 	else {
-		unsigned offset = state.playing ? (animation / 4) % (length + 8) : 0;
-		char scrolling[41] = {0};
-		for (unsigned index = 0; index < 40; ++index) {
+		unsigned offset = moving ? (animation / 4) % (length + 8) : 0;
+		char scrolling[51] = {0};
+		for (unsigned index = 0; index < 50; ++index) {
 			unsigned position = (offset + index) % (length + 8);
 			scrolling[index] = position < length ? files[selected][position] : ' ';
 		}
-		text(41, 58, scrolling, 1, INK, 40);
+		text(10, 6, scrolling, 1, INK, 50);
 	}
-	text(41, 74, "A", 1, INK, 1);
-	text(215, 74, "NORMAL BIAS", 1, INK, 12);
-	rect(49, 93, 222, 53, INK);
-	rect(115, 103, 90, 30, PAPER);
-	unsigned phase = state.playing ? animation % 8 : 0;
-	reel(88, phase);
-	reel(232, phase);
-	rect(136, 108, 48, 20, INK);
-	text(144, 115, "48K", 1, WHITE, 3);
-	line(91, 157, 229, 157, INK);
-	line(91, 157, 79, 172, INK);
-	line(229, 157, 241, 172, INK);
-	disc(37, 157, 3, INK);
-	disc(283, 157, 3, INK);
+	// The photo, with its two hubs overlaid at the current reel angle.
+	int left = (WIDTH - cassette.width) / 2;
+	image(left, CASSETTE_TOP, cassette.width, cassette.height, cassette_pixels);
+	if (moving) reel_frame = (reel_frame + 1) % cassette.frames;
+	size_t hub_bytes = cassette.hub_size * cassette.hub_size;
+	for (unsigned hub = 0; hub < 2; ++hub) {
+		image(left + cassette.hubs[hub][0], CASSETTE_TOP + cassette.hubs[hub][1],
+			  cassette.hub_size, cassette.hub_size,
+			  cassette_hubs + (reel_frame * 2 + hub) * hub_bytes);
+	}
 	rect(17, 184, 286, 3, MUTED);
 	rect(17, 184, 286 * state.percent / 100, 3, GREEN);
 	snprintf(label, sizeof(label), "%s", state.status);
@@ -804,22 +919,37 @@ static void render_cassette(unsigned animation)
 	rect(0, 211, WIDTH, 29, INK);
 	arrow(22, 217, false, WHITE);
 	text(43, 221, "FILES", 1, WHITE, 5);
-	if (state.playing) rect(183, 219, 12, 12, RED);
-	else arrow(184, 216, true, GREEN);
-	text(210, 221, state.playing ? "STOP" : "REPLAY", 1, WHITE, 8);
+	if (state.playing) {
+		if (paused) arrow(PAUSE_BUTTON_LEFT + 15, 216, true, GREEN);
+		else {
+			rect(PAUSE_BUTTON_LEFT + 14, 219, 4, 12, YELLOW);
+			rect(PAUSE_BUTTON_LEFT + 21, 219, 4, 12, YELLOW);
+		}
+		text(PAUSE_BUTTON_LEFT + 33, 221, paused ? "RESUME" : "PAUSE", 1, WHITE, 6);
+		rect(STOP_BUTTON_LEFT + 15, 219, 12, 12, RED);
+	} else {
+		arrow(STOP_BUTTON_LEFT + 16, 216, true, GREEN);
+	}
+	text(STOP_BUTTON_LEFT + 34, 221, state.playing ? "STOP" : "REPLAY", 1, WHITE, 8);
 }
 
 static void handle_tap(int screen_x, int screen_y)
 {
 	if (cassette_view) {
 		player_state_t state = player_snapshot();
-		if (screen_y >= 208 && screen_x < 140) {
+		if (screen_y >= 208 && screen_x < PAUSE_BUTTON_LEFT) {
 			atomic_store(&cancel_playback, true);
 			if (!state.playing) cassette_view = false;
-		} else if (screen_y >= 208 && screen_x >= 140) {
+		} else if (screen_y >= 208 && screen_x < STOP_BUTTON_LEFT) {
+			if (state.playing) toggle_pause();
+		} else if (screen_y >= 208) {
 			if (state.playing) atomic_store(&cancel_playback, true);
 			else start_playback();
 		}
+		return;
+	}
+	if (!builtin_library && card_state != CARD_READY) {
+		if (screen_y >= 202) open_builtin_library();
 		return;
 	}
 	if (screen_y >= 202) {
@@ -869,16 +999,17 @@ static void calibrate_touch(void)
 	wait_touch_release();
 	for (unsigned step = 0; step < 3;) {
 		render_calibration(step, "TAP THE CENTRE OF THE CROSS", INK);
-		// Poll without redrawing so short presses are not missed; redraw only on change.
+		// Poll without redrawing so short presses are not missed; redraw only on change,
+		// and never between detecting a press and sampling it.
 		touch_inputs_t shown = {.irq = -1};
 		for (;;) {
 			touch_inputs_t inputs = touch_inputs();
+			if (touch_inputs_pressed(&inputs)) break;
 			if (memcmp(&inputs, &shown, sizeof(inputs))) {
 				render_touch_inputs(&inputs);
 				display_flush();
 				shown = inputs;
 			}
-			if (touch_inputs_pressed(&inputs)) break;
 			vTaskDelay(pdMS_TO_TICKS(10));
 		}
 		unsigned raw_x;
@@ -901,11 +1032,45 @@ static void calibrate_touch(void)
 		}
 		calibration = solved;
 	}
-	bool saved = sd_mounted && save_calibration(raw);
-	render_calibration(3, saved ? "SAVED TO SD CARD" : "NOT SAVED - NO SD CARD",
+	bool saved = card_state == CARD_READY && save_calibration(raw);
+	render_calibration(3, saved ? "SAVED TO SD CARD" : "NOT SAVED - SD WRITE FAILED",
 					   saved ? GREEN : RED);
 	display_flush();
 	vTaskDelay(pdMS_TO_TICKS(1500));
+}
+
+// Runs once a card is mounted and verified: applies its calibration.json, or runs
+// the calibration screen and saves the file when it is missing or invalid.
+static void apply_card_calibration(void)
+{
+	if (load_calibration()) return;
+	// The FT6206 reports panel pixels and keeps its fixed mapping instead.
+	if (!touch_i2c) calibrate_touch();
+}
+
+// The slot has no card-detect line, so the card is polled: a mount attempt while
+// none is mounted, a status command while one is. Only call it while not playing.
+static void update_card(void)
+{
+	card_state_t state;
+	if (card_state == CARD_READY) {
+		if (sdmmc_get_status(sd_card) == ESP_OK) return;
+		esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
+		card_error = ESP_ERR_TIMEOUT;
+		state = CARD_MISSING;
+	} else {
+		state = mount_sd();
+	}
+	if (state == card_state) return;
+	ESP_LOGI(TAG, "SD card %s (%s)", card_state_names[state], esp_err_to_name(card_error));
+	card_state = state;
+	if (state == CARD_READY) {
+		builtin_library = false;
+		apply_card_calibration();
+	}
+	if (builtin_library) return;
+	cassette_view = false;
+	scan_files();
 }
 
 static void ui_task(void *argument)
@@ -915,12 +1080,13 @@ static void ui_task(void *argument)
 	bool return_to_files = false;
 	unsigned animation = 0;
 	TickType_t last_draw = 0;
+	TickType_t last_card_poll = xTaskGetTickCount();
 	for (;;) {
 		int screen_x = 0;
 		int screen_y = 0;
 		bool touched = touch_position(&screen_x, &screen_y);
 		if (touched && !touch_held) {
-			if (cassette_view && screen_y >= 208 && screen_x < 140) return_to_files = true;
+			if (cassette_view && screen_y >= 208 && screen_x < PAUSE_BUTTON_LEFT) return_to_files = true;
 			handle_tap(screen_x, screen_y);
 		}
 		if (return_to_files && !player_snapshot().playing) {
@@ -929,9 +1095,14 @@ static void ui_task(void *argument)
 		}
 		touch_held = touched;
 		TickType_t now = xTaskGetTickCount();
+		if (now - last_card_poll >= pdMS_TO_TICKS(CARD_POLL_MS) && !player_snapshot().playing) {
+			update_card();
+			last_card_poll = now;
+		}
 		if (now - last_draw >= pdMS_TO_TICKS(125) || !last_draw) {
 			if (cassette_view) render_cassette(animation++);
-			else render_browser();
+			else if (builtin_library || card_state == CARD_READY) render_browser();
+			else render_card_screen();
 			display_flush();
 			last_draw = now;
 		}
@@ -942,6 +1113,8 @@ static void ui_task(void *argument)
 void app_main(void)
 {
 	inputs_init();
+	touch_i2c_init();
+	palette_init();
 	display_init();
 	rect(0, 0, WIDTH, HEIGHT, PAPER);
 	display_flush();
@@ -950,10 +1123,21 @@ void app_main(void)
 		.quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 4096
 	};
 	ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &sd_bus, SPI_DMA_CH_AUTO));
-	// Read the SD card first; calibrate only when it has no calibration file.
+	// An empty slot must read 0xff (no response), not a floating MISO.
+	gpio_pullup_en(GPIO_NUM_19);
+	// Card polling logs its own state changes; the driver would log every failed attempt.
+	esp_log_level_set("vfs_fat_sdmmc", ESP_LOG_NONE);
+	esp_log_level_set("sdmmc_sd", ESP_LOG_NONE);
+	esp_log_level_set("sdmmc_common", ESP_LOG_NONE);
+	esp_log_level_set("gpio", ESP_LOG_WARN);
+	if (touch_i2c) {
+		// The FT6206 reports portrait panel pixels, which needs no touch setup.
+		calibration = (touch_calibration_t){.x = {0, -1, WIDTH - 1}, .y = {-1, 0, HEIGHT - 1}};
+	}
+	card_state = mount_sd();
+	ESP_LOGI(TAG, "SD card %s (%s)", card_state_names[card_state], esp_err_to_name(card_error));
+	if (card_state == CARD_READY) apply_card_calibration();
 	scan_files();
-	if (!sd_mounted) touch_use_spi_host();
-	if (!sd_mounted || !load_calibration()) calibrate_touch();
 	ESP_ERROR_CHECK(xTaskCreatePinnedToCore(ui_task, "tape_ui", 6144, NULL, 3, NULL, 1) == pdPASS
 					? ESP_OK : ESP_ERR_NO_MEM);
 }

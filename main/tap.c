@@ -78,6 +78,7 @@ const char *tap_result_text(tap_result_t result)
     case TAP_INVALID: return "INVALID TAP / CHECKSUM";
     case TAP_IO_ERROR: return "SD READ ERROR";
     case TAP_NO_MEMORY: return "NOT ENOUGH MEMORY";
+    case TAP_UNSUPPORTED: return "UNSUPPORTED TAPE BLOCK";
     default: return "PLAYBACK ERROR";
     }
 }

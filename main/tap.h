@@ -12,7 +12,8 @@ typedef enum {
     TAP_CANCELLED,
     TAP_INVALID,
     TAP_IO_ERROR,
-    TAP_NO_MEMORY
+    TAP_NO_MEMORY,
+    TAP_UNSUPPORTED
 } tap_result_t;
 
 tap_result_t tap_play(FILE *file, tap_pulse_fn pulse, tap_progress_fn progress, void *context);

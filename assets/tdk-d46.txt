@@ -1,0 +1,4 @@
+tdk-d46.jpg: "TDK D46 audio cassette" by Hannes Grobe/AWI (1920 px rendition).
+License: CC BY 3.0, https://creativecommons.org/licenses/by/3.0/
+Source: https://commons.wikimedia.org/wiki/File:TDK_D46_audio_cassette.jpg
+Converted to main/cassette.bin by tools/cassette_image.py (cropped, scaled, recoloured).
