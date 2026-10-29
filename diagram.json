@@ -4,78 +4,16 @@
   "editor": "wokwi",
   "parts": [
     {
-      "type": "board-esp32-devkit-c-v4",
+      "type": "board-esp32-2432s028r",
       "id": "esp",
       "top": 0,
       "left": 0,
+      "rotate": 180,
       "attrs": {}
-    },
-    {
-      "type": "wokwi-ili9341",
-      "id": "tft",
-      "top": 80,
-      "left": 300,
-      "attrs": {}
-    },
-    {
-      "type": "wokwi-microsd-card",
-      "id": "sd",
-      "top": -120,
-      "left": 300,
-      "attrs": {}
-    },
-    {
-      "type": "wokwi-buzzer",
-      "id": "speaker",
-      "top": -100,
-      "left": 540,
-      "attrs": { "volume": "0.15" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "next",
-      "top": 300,
-      "left": 300,
-      "attrs": { "color": "blue", "label": "NEXT", "key": "N" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "play",
-      "top": 300,
-      "left": 410,
-      "attrs": { "color": "green", "label": "PLAY / STOP", "key": "P" }
-    },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "back",
-      "top": 300,
-      "left": 540,
-      "attrs": { "color": "red", "label": "FILES", "key": "B" }
     }
   ],
   "connections": [
-    ["esp:15", "tft:CS", "green", []],
-    ["esp:2", "tft:D/C", "blue", []],
-    ["esp:13", "tft:MOSI", "orange", []],
-    ["esp:14", "tft:SCK", "yellow", []],
-    ["esp:12", "tft:MISO", "purple", []],
-    ["esp:3V3", "tft:VCC", "red", []],
-    ["esp:GND.1", "tft:GND", "black", []],
-    ["esp:3V3", "tft:RST", "red", []],
-    ["esp:21", "tft:LED", "red", []],
-    ["esp:18", "sd:SCK", "yellow", []],
-    ["esp:19", "sd:DO", "purple", []],
-    ["esp:23", "sd:DI", "orange", []],
-    ["esp:5", "sd:CS", "green", []],
-    ["esp:3V3", "sd:VCC", "red", []],
-    ["esp:GND.1", "sd:GND", "black", []],
-    ["esp:26", "speaker:2", "green", []],
-    ["esp:GND.1", "speaker:1", "black", []],
-    ["esp:27", "next:1.l", "blue", []],
-    ["esp:GND.1", "next:2.l", "black", []],
-    ["esp:22", "play:1.l", "green", []],
-    ["esp:GND.1", "play:2.l", "black", []],
-    ["esp:0", "back:1.l", "red", []],
-    ["esp:GND.1", "back:2.l", "black", []]
+    ["esp:TX", "$serialMonitor:RX", "", []],
+    ["esp:RX", "$serialMonitor:TX", "", []]
   ]
 }

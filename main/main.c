@@ -1,11 +1,13 @@
 #include <ctype.h>
 #include <dirent.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
 
+#include "cJSON.h"
 #include "driver/dac_continuous.h"
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
@@ -27,6 +29,7 @@
 #define AUDIO_BUFFER 2048
 #define TOUCH_MIN 200
 #define TOUCH_MAX 3900
+#define TOUCH_PRESSURE 400
 #define LCD_DC GPIO_NUM_2
 #define LCD_BL GPIO_NUM_21
 #define TOUCH_CS GPIO_NUM_33
@@ -34,9 +37,7 @@
 #define TOUCH_MOSI GPIO_NUM_32
 #define TOUCH_MISO GPIO_NUM_39
 #define TOUCH_IRQ GPIO_NUM_36
-#define KEY_NEXT GPIO_NUM_27
-#define KEY_SELECT GPIO_NUM_22
-#define KEY_BACK GPIO_NUM_0
+#define CALIBRATION_FILE "/sdcard/calibration.json"
 
 #define INK 0x18e3
 #define PAPER 0xef5b
@@ -48,6 +49,7 @@
 
 static const char *TAG = "tape";
 static spi_device_handle_t display;
+static spi_device_handle_t touch_spi;
 static uint8_t *frame;
 static uint16_t *stripe;
 static const uint16_t palette[] = {INK, PAPER, WHITE, MUTED, GREEN, RED, YELLOW};
@@ -57,10 +59,26 @@ static unsigned selected;
 static unsigned page;
 static bool truncated_list;
 static bool sd_mounted;
+static bool flash_mounted;
+static const char *library_root = "/sdcard";
 static bool cassette_view;
 static sdmmc_card_t *sd_card;
 static atomic_bool cancel_playback;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// screen = coefficient[0] * raw_x + coefficient[1] * raw_y + coefficient[2]
+typedef struct {
+	float x[3];
+	float y[3];
+} touch_calibration_t;
+
+static const int calibration_targets[3][2] = {{32, 32}, {288, 120}, {160, 208}};
+static touch_calibration_t calibration = {
+	.x = {0, (float)(WIDTH - 1) / (TOUCH_MAX - TOUCH_MIN),
+		  -(float)TOUCH_MIN * (WIDTH - 1) / (TOUCH_MAX - TOUCH_MIN)},
+	.y = {-(float)(HEIGHT - 1) / (TOUCH_MAX - TOUCH_MIN), 0,
+		  (float)TOUCH_MAX * (HEIGHT - 1) / (TOUCH_MAX - TOUCH_MIN)}
+};
 
 typedef struct {
 	bool playing;
@@ -252,13 +270,39 @@ static void inputs_init(void)
 		.mode = GPIO_MODE_INPUT
 	};
 	ESP_ERROR_CHECK(gpio_config(&inputs));
-	inputs.pin_bit_mask = (1ULL << KEY_NEXT) | (1ULL << KEY_SELECT) | (1ULL << KEY_BACK);
-	inputs.pull_up_en = GPIO_PULLUP_ENABLE;
-	ESP_ERROR_CHECK(gpio_config(&inputs));
+}
+
+// Without a microSD card the SD SPI host is idle, so touch moves onto it. Wokwi's
+// XPT2046 model only answers the SPI peripheral, not bit-banged GPIO.
+static void touch_use_spi_host(void)
+{
+	esp_err_t result = spi_bus_free(SPI3_HOST);
+	if (result != ESP_OK) {
+		ESP_LOGW(TAG, "Touch keeps software SPI: %s", esp_err_to_name(result));
+		return;
+	}
+	spi_bus_config_t bus = {
+		.mosi_io_num = TOUCH_MOSI, .miso_io_num = TOUCH_MISO, .sclk_io_num = TOUCH_CLK,
+		.quadwp_io_num = -1, .quadhd_io_num = -1
+	};
+	ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &bus, SPI_DMA_DISABLED));
+	spi_device_interface_config_t device = {
+		.clock_speed_hz = 2000000, .spics_io_num = TOUCH_CS, .queue_size = 1
+	};
+	ESP_ERROR_CHECK(spi_bus_add_device(SPI3_HOST, &device, &touch_spi));
+	ESP_LOGI(TAG, "Touch uses the SPI3 host");
 }
 
 static unsigned touch_read(uint8_t command)
 {
+	if (touch_spi) {
+		spi_transaction_t transaction = {
+			.flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_USE_RXDATA, .length = 24,
+			.tx_data = {command}
+		};
+		ESP_ERROR_CHECK(spi_device_polling_transmit(touch_spi, &transaction));
+		return ((transaction.rx_data[1] << 8 | transaction.rx_data[2]) >> 3) & 4095;
+	}
 	gpio_set_level(TOUCH_CS, 0);
 	for (unsigned bit = 0; bit < 8; ++bit) {
 		gpio_set_level(TOUCH_MOSI, (command >> (7 - bit)) & 1);
@@ -269,9 +313,10 @@ static unsigned touch_read(uint8_t command)
 	}
 	unsigned result = 0;
 	for (unsigned bit = 0; bit < 16; ++bit) {
+		// MISO changes on the falling edge; sample it just before the rising edge.
+		result = (result << 1) | gpio_get_level(TOUCH_MISO);
 		gpio_set_level(TOUCH_CLK, 1);
 		esp_rom_delay_us(2);
-		result = (result << 1) | gpio_get_level(TOUCH_MISO);
 		gpio_set_level(TOUCH_CLK, 0);
 		esp_rom_delay_us(2);
 	}
@@ -279,22 +324,182 @@ static unsigned touch_read(uint8_t command)
 	return (result >> 3) & 4095;
 }
 
+typedef struct {
+	int irq;
+	unsigned z1;
+	unsigned z2;
+	unsigned x;
+	unsigned y;
+} touch_inputs_t;
+
+static touch_inputs_t touch_inputs(void)
+{
+	return (touch_inputs_t){
+		.irq = gpio_get_level(TOUCH_IRQ), .z1 = touch_read(0xb0), .z2 = touch_read(0xc0),
+		.x = touch_read(0xd0), .y = touch_read(0x90)
+	};
+}
+
+// A press is PENIRQ low or enough pressure, so it works whichever of the two
+// the Wokwi model drives.
+static bool touch_inputs_pressed(const touch_inputs_t *inputs)
+{
+	bool pressed = !inputs->irq || inputs->z1 + 4095 - inputs->z2 >= TOUCH_PRESSURE;
+	return pressed && inputs->x > 0 && inputs->x < 4095 && inputs->y > 0 && inputs->y < 4095;
+}
+
+static bool touch_raw(unsigned *raw_x, unsigned *raw_y)
+{
+	touch_inputs_t inputs = touch_inputs();
+	*raw_x = inputs.x;
+	*raw_y = inputs.y;
+	return touch_inputs_pressed(&inputs);
+}
+
+static bool touch_pressed(void)
+{
+	unsigned raw_x;
+	unsigned raw_y;
+	return touch_raw(&raw_x, &raw_y);
+}
+
+static int clamp(float value, int limit)
+{
+	if (value < 0) return 0;
+	return value > limit - 1 ? limit - 1 : (int)value;
+}
+
 static bool touch_position(int *screen_x, int *screen_y)
 {
-	if (gpio_get_level(TOUCH_IRQ)) return false;
-	unsigned raw_x = touch_read(0xd0);
-	unsigned raw_y = touch_read(0x90);
-	if (raw_x < TOUCH_MIN || raw_x > TOUCH_MAX || raw_y < TOUCH_MIN || raw_y > TOUCH_MAX) {
+	unsigned raw_x;
+	unsigned raw_y;
+	if (!touch_raw(&raw_x, &raw_y)) return false;
+	*screen_x = clamp(calibration.x[0] * raw_x + calibration.x[1] * raw_y + calibration.x[2], WIDTH);
+	*screen_y = clamp(calibration.y[0] * raw_x + calibration.y[1] * raw_y + calibration.y[2], HEIGHT);
+	return true;
+}
+
+static void wait_touch_release(void)
+{
+	while (touch_pressed()) vTaskDelay(pdMS_TO_TICKS(10));
+	vTaskDelay(pdMS_TO_TICKS(50));
+}
+
+// Averages the raw readings of the current press until release.
+static bool touch_sample(unsigned *raw_x, unsigned *raw_y)
+{
+	vTaskDelay(pdMS_TO_TICKS(30));
+	unsigned count = 0;
+	unsigned sum_x = 0;
+	unsigned sum_y = 0;
+	while (count < 16 && touch_raw(raw_x, raw_y)) {
+		sum_x += *raw_x;
+		sum_y += *raw_y;
+		++count;
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+	wait_touch_release();
+	if (count < 2) return false;
+	*raw_x = sum_x / count;
+	*raw_y = sum_y / count;
+	return true;
+}
+
+// Solves the affine map from three raw points to their screen targets (Cramer's rule).
+static bool solve_calibration(const float raw[3][2], touch_calibration_t *result)
+{
+	float determinant = raw[0][0] * (raw[1][1] - raw[2][1]) - raw[0][1] * (raw[1][0] - raw[2][0])
+						+ (raw[1][0] * raw[2][1] - raw[2][0] * raw[1][1]);
+	if (fabsf(determinant) < 10000) return false;
+	for (unsigned axis = 0; axis < 2; ++axis) {
+		float s0 = calibration_targets[0][axis];
+		float s1 = calibration_targets[1][axis];
+		float s2 = calibration_targets[2][axis];
+		float *out = axis ? result->y : result->x;
+		out[0] = (s0 * (raw[1][1] - raw[2][1]) - raw[0][1] * (s1 - s2)
+				  + (s1 * raw[2][1] - s2 * raw[1][1])) / determinant;
+		out[1] = (raw[0][0] * (s1 - s2) - s0 * (raw[1][0] - raw[2][0])
+				  + (raw[1][0] * s2 - raw[2][0] * s1)) / determinant;
+		out[2] = (raw[0][0] * (raw[1][1] * s2 - raw[2][1] * s1)
+				  - raw[0][1] * (raw[1][0] * s2 - raw[2][0] * s1)
+				  + s0 * (raw[1][0] * raw[2][1] - raw[2][0] * raw[1][1])) / determinant;
+	}
+	return true;
+}
+
+static bool calibration_valid(const touch_calibration_t *candidate)
+{
+	for (unsigned index = 0; index < 3; ++index) {
+		if (!isfinite(candidate->x[index]) || !isfinite(candidate->y[index])) return false;
+	}
+	return fabsf(candidate->x[0] * candidate->y[1] - candidate->x[1] * candidate->y[0]) > 1e-6f;
+}
+
+static bool read_coefficients(const cJSON *root, const char *key, float values[3])
+{
+	const cJSON *array = cJSON_GetObjectItemCaseSensitive(root, key);
+	if (!cJSON_IsArray(array) || cJSON_GetArraySize(array) != 3) return false;
+	for (unsigned index = 0; index < 3; ++index) {
+		const cJSON *item = cJSON_GetArrayItem(array, index);
+		if (!cJSON_IsNumber(item)) return false;
+		values[index] = item->valuedouble;
+	}
+	return true;
+}
+
+static bool load_calibration(void)
+{
+	FILE *file = fopen(CALIBRATION_FILE, "r");
+	if (!file) return false;
+	char json[512];
+	size_t length = fread(json, 1, sizeof(json) - 1, file);
+	fclose(file);
+	json[length] = 0;
+	cJSON *root = cJSON_Parse(json);
+	touch_calibration_t loaded;
+	bool ok = root && read_coefficients(root, "x", loaded.x) && read_coefficients(root, "y", loaded.y)
+			  && calibration_valid(&loaded);
+	cJSON_Delete(root);
+	if (!ok) {
+		ESP_LOGW(TAG, "Ignoring invalid %s", CALIBRATION_FILE);
 		return false;
 	}
-	*screen_x = (raw_y - TOUCH_MIN) * (WIDTH - 1) / (TOUCH_MAX - TOUCH_MIN);
-	*screen_y = (TOUCH_MAX - raw_x) * (HEIGHT - 1) / (TOUCH_MAX - TOUCH_MIN);
+	calibration = loaded;
+	ESP_LOGI(TAG, "Loaded %s", CALIBRATION_FILE);
 	return true;
+}
+
+static bool save_calibration(const float raw[3][2])
+{
+	cJSON *root = cJSON_CreateObject();
+	cJSON_AddNumberToObject(root, "version", 1);
+	cJSON_AddNumberToObject(root, "width", WIDTH);
+	cJSON_AddNumberToObject(root, "height", HEIGHT);
+	cJSON_AddItemToObject(root, "x", cJSON_CreateFloatArray(calibration.x, 3));
+	cJSON_AddItemToObject(root, "y", cJSON_CreateFloatArray(calibration.y, 3));
+	cJSON *points = cJSON_AddArrayToObject(root, "points");
+	for (unsigned index = 0; index < 3; ++index) {
+		cJSON *point = cJSON_CreateObject();
+		cJSON_AddNumberToObject(point, "screen_x", calibration_targets[index][0]);
+		cJSON_AddNumberToObject(point, "screen_y", calibration_targets[index][1]);
+		cJSON_AddNumberToObject(point, "raw_x", raw[index][0]);
+		cJSON_AddNumberToObject(point, "raw_y", raw[index][1]);
+		cJSON_AddItemToArray(points, point);
+	}
+	char *json = cJSON_Print(root);
+	cJSON_Delete(root);
+	FILE *file = json ? fopen(CALIBRATION_FILE, "w") : NULL;
+	bool ok = file && fputs(json, file) >= 0;
+	if (file) ok = fclose(file) == 0 && ok;
+	cJSON_free(json);
+	if (!ok) ESP_LOGW(TAG, "Could not write %s", CALIBRATION_FILE);
+	return ok;
 }
 
 static bool mount_sd(void)
 {
 	if (sd_mounted) return true;
+	if (touch_spi) return false;
 	sdmmc_host_t host = SDSPI_HOST_DEFAULT();
 	host.slot = SPI3_HOST;
 	host.max_freq_khz = 10000;
@@ -313,6 +518,19 @@ static bool mount_sd(void)
 	return true;
 }
 
+static bool mount_flash(void)
+{
+	if (flash_mounted) return true;
+	esp_vfs_fat_mount_config_t mount = {.format_if_mount_failed = false, .max_files = 4};
+	esp_err_t result = esp_vfs_fat_spiflash_mount_ro("/flash", "storage", &mount);
+	if (result != ESP_OK) {
+		ESP_LOGW(TAG, "Flash mount: %s", esp_err_to_name(result));
+		return false;
+	}
+	flash_mounted = true;
+	return true;
+}
+
 static int compare_names(const void *left, const void *right)
 {
 	return strcasecmp(left, right);
@@ -324,11 +542,15 @@ static void scan_files(void)
 	page = 0;
 	selected = 0;
 	truncated_list = false;
-	if (!mount_sd()) return;
-	DIR *directory = opendir("/sdcard");
+	if (mount_sd()) library_root = "/sdcard";
+	else if (mount_flash()) library_root = "/flash";
+	else return;
+	DIR *directory = opendir(library_root);
 	if (!directory) {
-		esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
-		sd_mounted = false;
+		if (sd_mounted) {
+			esp_vfs_fat_sdcard_unmount("/sdcard", sd_card);
+			sd_mounted = false;
+		}
 		return;
 	}
 	struct dirent *entry;
@@ -338,7 +560,7 @@ static void scan_files(void)
 			continue;
 		}
 		char path[NAME_SIZE + 9];
-		snprintf(path, sizeof(path), "/sdcard/%s", entry->d_name);
+		snprintf(path, sizeof(path), "%s/%s", library_root, entry->d_name);
 		struct stat info;
 		if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) continue;
 		if (file_count == MAX_FILES) {
@@ -407,7 +629,7 @@ static void playback_task(void *argument)
 {
 	(void)argument;
 	char path[NAME_SIZE + 9];
-	snprintf(path, sizeof(path), "/sdcard/%s", files[selected]);
+	snprintf(path, sizeof(path), "%s/%s", library_root, files[selected]);
 	FILE *file = fopen(path, "rb");
 	audio_t *audio = calloc(1, sizeof(*audio));
 	tap_result_t result = file ? TAP_NO_MEMORY : TAP_IO_ERROR;
@@ -490,7 +712,7 @@ static void render_browser(void)
 	rect(0, 0, WIDTH, 43, INK);
 	text(12, 9, "TAPE LIBRARY", 2, WHITE, 24);
 	text(13, 30, "ZX SPECTRUM", 1, GREEN, 25);
-	text(249, 30, "SD / TAP", 1, WHITE, 11);
+	text(249, 30, sd_mounted ? "SD / TAP" : "FLASH / TAP", 1, WHITE, 11);
 	if (!file_count) {
 		text(24, 83, sd_mounted ? "NO TAP FILES" : "SD NOT READY", 2, INK, 23);
 		text(24, 116, sd_mounted ? "ROOT / *.TAP" : "FAT32 MICROSD", 1, INK, 40);
@@ -614,13 +836,82 @@ static void handle_tap(int screen_x, int screen_y)
 	}
 }
 
+static void render_calibration(unsigned step, const char *message, uint16_t color)
+{
+	char label[16];
+	rect(0, 0, WIDTH, HEIGHT, PAPER);
+	text(94, 84, "TOUCH SETUP", 2, INK, 11);
+	text((WIDTH - (int)strlen(message) * 6) / 2, 110, message, 1, color, 30);
+	if (step >= 3) return;
+	snprintf(label, sizeof(label), "POINT %u/3", step + 1);
+	text(130, 128, label, 1, MUTED, 10);
+	int x = calibration_targets[step][0];
+	int y = calibration_targets[step][1];
+	rect(x - 12, y, 25, 1, RED);
+	rect(x, y - 12, 1, 25, RED);
+	rect(x - 2, y - 2, 5, 5, INK);
+}
+
+// Shows the controller readings so touch problems can be diagnosed on screen.
+static void render_touch_inputs(const touch_inputs_t *inputs)
+{
+	char label[48];
+	snprintf(label, sizeof(label), "IRQ %d Z1 %u Z2 %u X %u Y %u",
+			 inputs->irq, inputs->z1, inputs->z2, inputs->x, inputs->y);
+	rect(0, 146, WIDTH, 15, PAPER);
+	text((WIDTH - (int)strlen(label) * 6) / 2, 150, label, 1, MUTED, 40);
+	ESP_LOGI(TAG, "Touch: %s", label);
+}
+
+static void calibrate_touch(void)
+{
+	float raw[3][2];
+	wait_touch_release();
+	for (unsigned step = 0; step < 3;) {
+		render_calibration(step, "TAP THE CENTRE OF THE CROSS", INK);
+		// Poll without redrawing so short presses are not missed; redraw only on change.
+		touch_inputs_t shown = {.irq = -1};
+		for (;;) {
+			touch_inputs_t inputs = touch_inputs();
+			if (memcmp(&inputs, &shown, sizeof(inputs))) {
+				render_touch_inputs(&inputs);
+				display_flush();
+				shown = inputs;
+			}
+			if (touch_inputs_pressed(&inputs)) break;
+			vTaskDelay(pdMS_TO_TICKS(10));
+		}
+		unsigned raw_x;
+		unsigned raw_y;
+		if (!touch_sample(&raw_x, &raw_y)) {
+			ESP_LOGW(TAG, "Touch released too quickly");
+			continue;
+		}
+		raw[step][0] = raw_x;
+		raw[step][1] = raw_y;
+		ESP_LOGI(TAG, "Calibration point %u: raw %u, %u", step + 1, raw_x, raw_y);
+		if (++step < 3) continue;
+		touch_calibration_t solved;
+		if (!solve_calibration(raw, &solved) || !calibration_valid(&solved)) {
+			render_calibration(3, "POINTS TOO CLOSE - TRY AGAIN", RED);
+			display_flush();
+			vTaskDelay(pdMS_TO_TICKS(1500));
+			step = 0;
+			continue;
+		}
+		calibration = solved;
+	}
+	bool saved = sd_mounted && save_calibration(raw);
+	render_calibration(3, saved ? "SAVED TO SD CARD" : "NOT SAVED - NO SD CARD",
+					   saved ? GREEN : RED);
+	display_flush();
+	vTaskDelay(pdMS_TO_TICKS(1500));
+}
+
 static void ui_task(void *argument)
 {
 	(void)argument;
 	bool touch_held = false;
-	bool next_held = false;
-	bool select_held = false;
-	bool back_held = false;
 	bool return_to_files = false;
 	unsigned animation = 0;
 	TickType_t last_draw = 0;
@@ -628,34 +919,15 @@ static void ui_task(void *argument)
 		int screen_x = 0;
 		int screen_y = 0;
 		bool touched = touch_position(&screen_x, &screen_y);
-		bool next = !gpio_get_level(KEY_NEXT);
-		bool select = !gpio_get_level(KEY_SELECT);
-		bool back = !gpio_get_level(KEY_BACK);
 		if (touched && !touch_held) {
 			if (cassette_view && screen_y >= 208 && screen_x < 140) return_to_files = true;
 			handle_tap(screen_x, screen_y);
-		}
-		if (next && !next_held && !cassette_view && file_count) {
-			selected = (selected + 1) % file_count;
-			page = selected / PAGE_ROWS;
-		}
-		if (select && !select_held) {
-			if (cassette_view) handle_tap(210, 225);
-			else if (file_count) start_playback();
-			else scan_files();
-		}
-		if (back && !back_held) {
-			atomic_store(&cancel_playback, true);
-			return_to_files = true;
 		}
 		if (return_to_files && !player_snapshot().playing) {
 			cassette_view = false;
 			return_to_files = false;
 		}
 		touch_held = touched;
-		next_held = next;
-		select_held = select;
-		back_held = back;
 		TickType_t now = xTaskGetTickCount();
 		if (now - last_draw >= pdMS_TO_TICKS(125) || !last_draw) {
 			if (cassette_view) render_cassette(animation++);
@@ -671,14 +943,17 @@ void app_main(void)
 {
 	inputs_init();
 	display_init();
-	render_browser();
+	rect(0, 0, WIDTH, HEIGHT, PAPER);
 	display_flush();
 	spi_bus_config_t sd_bus = {
 		.mosi_io_num = 23, .miso_io_num = 19, .sclk_io_num = 18,
 		.quadwp_io_num = -1, .quadhd_io_num = -1, .max_transfer_sz = 4096
 	};
 	ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &sd_bus, SPI_DMA_CH_AUTO));
+	// Read the SD card first; calibrate only when it has no calibration file.
 	scan_files();
+	if (!sd_mounted) touch_use_spi_host();
+	if (!sd_mounted || !load_calibration()) calibrate_touch();
 	ESP_ERROR_CHECK(xTaskCreatePinnedToCore(ui_task, "tape_ui", 6144, NULL, 3, NULL, 1) == pdPASS
 					? ESP_OK : ESP_ERR_NO_MEM);
 }

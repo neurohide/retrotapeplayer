@@ -15,8 +15,8 @@ ILI9341 / XPT2046 "Cheap Yellow Display"), using ESP-IDF 5.4.
 	playing; the progress bar and block number update during playback.
 5. Touch the square to stop, the triangle to replay from the beginning, or
 	**FILES** to stop and return to the library. Library arrows change pages;
-	**RESCAN** retries mounting and refreshes the list. The board's BOOT button
-	also stops playback and returns to the library.
+	**RESCAN** retries mounting and refreshes the list. All controls are on the
+	touchscreen.
 
 Long filenames are enabled in FATFS. The library holds up to 96 files, five per
 page; `96 MAX` indicates additional files were not listed. Subdirectories are
@@ -26,6 +26,11 @@ Missing cards, empty directories, malformed TAP blocks, bad checksums, and
 read/audio failures have explicit display states. A failed mount **never
 formats the card**. Stop playback before removing a card; restart the board
 after swapping cards.
+
+When no microSD card mounts, the library falls back to a read-only FAT
+partition in flash (`storage` in `partitions.csv`), built from the `sdcard/`
+folder and written with the firmware. The header shows `SD / TAP` or
+`FLASH / TAP` for the active source. The board needs 4 MB of flash.
 
 ## Board Connections
 
@@ -37,15 +42,35 @@ after swapping cards.
 | XPT2046 CS / interrupt | 33 / 36 |
 | microSD MOSI / MISO / clock / CS | 23 / 19 / 18 / 5 |
 | Built-in DAC to onboard speaker amplifier | 26 |
-| Optional next / play-stop / files buttons | 27 / 22 / 0 |
 
-Optional buttons are active-low, connected between GPIO and ground. GPIO0 is
-the onboard BOOT button; do not hold it while resetting. Touch uses a separate
-software SPI bus, leaving both hardware SPI buses available for LCD and SD.
-Touch calibration defaults to raw coordinates 200..3900 with landscape axis
-swapping. If a board revision has reversed or offset touch coordinates, adjust
-`TOUCH_MIN`, `TOUCH_MAX`, and `touch_position()` in `main/main.c`. Boards with a
-different LCD controller (such as ST7789 variants) need a different LCD setup.
+Touch uses a separate software SPI bus, leaving both hardware SPI buses available
+for LCD and SD. When no microSD card mounts at startup, touch moves onto the
+idle SD SPI host instead (Wokwi's XPT2046 model only answers hardware SPI); a
+card inserted later is then not detected until the board restarts. Boards with a
+different LCD controller (such as ST7789 variants)
+need a different LCD setup.
+
+## Touch Calibration
+
+At startup the firmware reads the microSD card and loads `calibration.json`
+from its root. If the file is missing or invalid, or there is no card, it shows
+the calibration screen before the file browser: tap the centre of each of three
+crosses. The three points give an affine mapping from raw XPT2046 readings
+to screen pixels, which covers swapped, mirrored, offset, and slightly rotated
+panels. The result is written back to the card:
+
+```json
+{
+	"version": 1, "width": 320, "height": 240,
+	"x": [0, 0.0862, -17.24],
+	"y": [-0.0646, 0, 251.9],
+	"points": [{"screen_x": 32, "screen_y": 32, "raw_x": 3405, "raw_y": 571}, ...]
+}
+```
+
+`screen_x = x[0] * raw_x + x[1] * raw_y + x[2]`, and likewise for `y`;
+`points` records the raw readings for reference. Delete the file to recalibrate.
+Without a card the calibration is used for that session only.
 
 ## TAP Audio
 
@@ -70,20 +95,16 @@ to the ESP32 DAC pin.
 
 ## Simulation
 
-The Wokwi diagram approximates the board with an ESP32 DevKitC, ILI9341, SPI
-microSD card, buzzer, and three buttons. Build the firmware, then run **Wokwi:
-Start Simulator**. With Wokwi for VS Code 4.0.0 or later, put `.tap` files in
-the local `sdcard/` folder and restart the simulation to load them onto the
-virtual card. Folder-backed cards are FAT16, also supported by the firmware.
-To test FAT32 specifically, use a FAT32 raw disk image with an `[[sdcard]]`
-section and `image = 'sd.img'` in `wokwi.toml` instead.
+The Wokwi diagram uses Wokwi's `board-esp32-2432s028r` part, a replica of this
+board with its ILI9341 display and XPT2046 touchscreen on the same pins. Click
+the screen to touch it. Put `.tap` files in the `sdcard/` folder, build the
+firmware, then run **Wokwi: Start Simulator**.
 
-The touchscreen is not emulated, so use the diagram buttons: **NEXT** selects
-the next file, **PLAY / STOP** opens it or stops/replays the cassette, and
-**FILES** returns to the library. On an empty library, **PLAY / STOP** rescans.
-The diagram also binds these buttons to N, P, and B. The buzzer only approximates
-the speaker; actual DAC playback, touch calibration, and real Spectrum loading
-must be checked on physical hardware.
+The board part does not expose the microSD slot or the speaker, so the
+simulated library always reads the flash copy of `sdcard/` (rebuild after
+changing the folder) and playback is silent. Actual DAC playback, SD card
+mounting, touch calibration, and real Spectrum loading must be checked on
+physical hardware.
 
 ## Decoder Tests
 
