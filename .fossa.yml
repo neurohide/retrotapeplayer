@@ -1,0 +1,10 @@
+version: 3
+
+project:
+  id: tape-player
+  name: tape player
+  license: GPL-3.0-or-later
+
+paths:
+  exclude:
+    - ./build

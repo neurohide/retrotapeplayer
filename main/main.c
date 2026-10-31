@@ -46,6 +46,10 @@
 #define TOUCH_SCL GPIO_NUM_22
 #define FT6206_ADDRESS 0x38
 #define CALIBRATION_FILE "/sdcard/calibration.json"
+#define SETTINGS_FILE "/sdcard/settings.json"
+#define VOLUME_MAX 10
+#define VOLUME_DEFAULT (VOLUME_MAX / 2)
+#define VOLUME_LEFT 290
 #define CASSETTE_TOP 18
 #define CASSETTE_TRANSPARENT 255
 #define SPLASH_MS 1000
@@ -84,10 +88,17 @@ static char card_label[24]; // FAT volume label of the mounted card, "" if it ha
 static bool flash_mounted;
 static bool builtin_library;
 static const char *library_root = "/sdcard";
+// Open sub-folder relative to library_root, "" at the root. Folders are listed with a
+// trailing '/', and "../" leads back up.
+static char folder[NAME_SIZE];
 static bool cassette_view;
+static bool busy_shown;
 static sdmmc_card_t *sd_card;
 static atomic_bool cancel_playback;
 static atomic_bool pause_playback;
+// 0..VOLUME_MAX, read by the playback task for every pulse.
+static atomic_uint volume = VOLUME_DEFAULT;
+static unsigned saved_volume = VOLUME_DEFAULT;
 static portMUX_TYPE state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // screen = coefficient[0] * raw_x + coefficient[1] * raw_y + coefficient[2]
@@ -567,6 +578,46 @@ static bool save_calibration(const float raw[3][2])
 	return ok;
 }
 
+static void save_settings(void)
+{
+	cJSON *root = cJSON_CreateObject();
+	cJSON_AddNumberToObject(root, "volume", atomic_load(&volume));
+	char *json = cJSON_Print(root);
+	cJSON_Delete(root);
+	FILE *file = json ? fopen(SETTINGS_FILE, "w") : NULL;
+	bool ok = file && fputs(json, file) >= 0;
+	if (file) ok = fclose(file) == 0 && ok;
+	cJSON_free(json);
+	if (!ok) {
+		ESP_LOGW(TAG, "Could not write %s", SETTINGS_FILE);
+		return;
+	}
+	saved_volume = atomic_load(&volume);
+	ESP_LOGI(TAG, "Saved %s (volume %u)", SETTINGS_FILE, saved_volume);
+}
+
+// A missing or invalid file starts at the middle volume and is written back.
+static void load_settings(void)
+{
+	FILE *file = fopen(SETTINGS_FILE, "r");
+	char json[256] = {0};
+	if (file) {
+		fread(json, 1, sizeof(json) - 1, file);
+		fclose(file);
+	}
+	cJSON *root = cJSON_Parse(json);
+	const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "volume");
+	bool ok = cJSON_IsNumber(item) && item->valueint >= 0 && item->valueint <= VOLUME_MAX;
+	atomic_store(&volume, ok ? (unsigned)item->valueint : VOLUME_DEFAULT);
+	cJSON_Delete(root);
+	if (!ok) {
+		save_settings();
+		return;
+	}
+	saved_volume = atomic_load(&volume);
+	ESP_LOGI(TAG, "Loaded %s (volume %u)", SETTINGS_FILE, saved_volume);
+}
+
 // Mounts the card when one answers and keeps it only if it holds a FAT16 or FAT32
 // volume. An empty slot times out or answers garbage to the first commands; any
 // other failure is a card that answers but cannot be used (no FAT volume, exFAT).
@@ -619,9 +670,24 @@ static bool has_extension(const char *name, const char *extension)
 	return length > 4 && !strcasecmp(name + length - 4, extension);
 }
 
+static bool is_folder(const char *name)
+{
+	return name[strlen(name) - 1] == '/';
+}
+
+// "../" first, then folders, then tapes.
 static int compare_names(const void *left, const void *right)
 {
+	if (!strcmp(left, "../")) return -1;
+	if (!strcmp(right, "../")) return 1;
+	if (is_folder(left) != is_folder(right)) return is_folder(left) ? -1 : 1;
 	return strcasecmp(left, right);
+}
+
+static void entry_path(char *path, size_t size, const char *name)
+{
+	if (folder[0]) snprintf(path, size, "%s/%s/%s", library_root, folder, name);
+	else snprintf(path, size, "%s/%s", library_root, name);
 }
 
 static void scan_files(void)
@@ -633,35 +699,76 @@ static void scan_files(void)
 	if (builtin_library) library_root = "/flash";
 	else if (card_state == CARD_READY) library_root = "/sdcard";
 	else return;
-	DIR *directory = opendir(library_root);
+	char path[2 * NAME_SIZE + 16];
+	entry_path(path, sizeof(path), "");
+	DIR *directory = opendir(path);
+	if (!directory && folder[0]) {
+		// The folder went away (RESCAN after editing the card): back to the root.
+		folder[0] = 0;
+		directory = opendir(library_root);
+	}
 	if (!directory) return;
+	if (folder[0]) memcpy(files[file_count++], "../", 4);
 	struct dirent *entry;
 	while ((entry = readdir(directory))) {
 		size_t length = strlen(entry->d_name);
 		// Dot files are hidden, such as the "._NAME.tap" metadata macOS writes to cards.
-		if (entry->d_name[0] == '.' || length >= NAME_SIZE
-			|| !(has_extension(entry->d_name, ".tap") || has_extension(entry->d_name, ".tzx")
-				 || has_extension(entry->d_name, ".cas"))) {
+		if (entry->d_name[0] == '.' || length >= NAME_SIZE - 1
+			|| !strcmp(entry->d_name, "System Volume Information")) {
 			continue;
 		}
-		char path[NAME_SIZE + 9];
-		snprintf(path, sizeof(path), "%s/%s", library_root, entry->d_name);
+		bool tape = has_extension(entry->d_name, ".tap") || has_extension(entry->d_name, ".tzx")
+					|| has_extension(entry->d_name, ".cas");
+		entry_path(path, sizeof(path), entry->d_name);
 		struct stat info;
-		if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) continue;
+		if (stat(path, &info) != 0) continue;
+		bool subfolder = S_ISDIR(info.st_mode) && strlen(folder) + 1 + length < NAME_SIZE;
+		if (!subfolder && !(tape && S_ISREG(info.st_mode))) continue;
 		if (file_count == MAX_FILES) {
 			truncated_list = true;
 			break;
 		}
-		memcpy(files[file_count++], entry->d_name, length + 1);
+		memcpy(files[file_count], entry->d_name, length + 1);
+		if (subfolder) memcpy(files[file_count] + length, "/", 2);
+		++file_count;
 	}
 	closedir(directory);
 	qsort(files, file_count, sizeof(files[0]), compare_names);
 }
 
+// Draws a "please wait" pane over the current screen before a slow operation in the UI
+// task. Touches are ignored until the operation ends and the finger is lifted.
+static void show_busy(const char *message)
+{
+	rect(50, 82, 220, 76, INK);
+	rect(53, 85, 214, 70, WHITE);
+	text(94, 100, "PLEASE WAIT", 2, INK, 11);
+	text((WIDTH - (int)strlen(message) * 6) / 2, 132, message, 1, MUTED, 34);
+	display_flush();
+	busy_shown = true;
+}
+
+// Enters a listed folder, or leaves the current one for "../".
+static void open_folder(const char *name)
+{
+	show_busy("READING FOLDER");
+	if (!strcmp(name, "../")) {
+		char *slash = strrchr(folder, '/');
+		*(slash ? slash : folder) = 0;
+	} else {
+		size_t length = strlen(folder);
+		if (length) folder[length++] = '/';
+		snprintf(folder + length, sizeof(folder) - length, "%.*s", (int)strlen(name) - 1, name);
+	}
+	scan_files();
+}
+
 static void open_builtin_library(void)
 {
+	show_busy("OPENING BUILT-IN TAPES");
 	if (!mount_flash()) return;
 	builtin_library = true;
+	folder[0] = 0;
 	scan_files();
 }
 
@@ -709,7 +816,8 @@ static bool audio_pulse(uint32_t tstates, bool silence, void *context)
 	audio->remainder += (uint64_t)tstates * SAMPLE_RATE;
 	unsigned count = audio->remainder / 3500000;
 	audio->remainder %= 3500000;
-	uint8_t value = silence ? 128 : (audio->high ? 208 : 48);
+	int amplitude = 127 * (int)atomic_load(&volume) / VOLUME_MAX;
+	uint8_t value = silence ? 128 : 128 + (audio->high ? amplitude : -amplitude);
 	while (count) {
 		size_t available = AUDIO_BUFFER - audio->used;
 		size_t chunk = count < available ? count : available;
@@ -772,8 +880,8 @@ static dac_continuous_handle_t audio_output(void)
 static void playback_task(void *argument)
 {
 	(void)argument;
-	char path[NAME_SIZE + 9];
-	snprintf(path, sizeof(path), "%s/%s", library_root, files[selected]);
+	char path[2 * NAME_SIZE + 16];
+	entry_path(path, sizeof(path), files[selected]);
 	FILE *file = fopen(path, "rb");
 	bool msx = has_extension(files[selected], ".cas");
 	bool tzx = has_extension(files[selected], ".tzx");
@@ -819,7 +927,7 @@ static player_state_t player_snapshot(void)
 
 static void start_playback(void)
 {
-	if (!file_count || player_snapshot().playing) return;
+	if (!file_count || is_folder(files[selected]) || player_snapshot().playing) return;
 	atomic_store(&cancel_playback, false);
 	atomic_store(&pause_playback, false);
 	cassette_view = true;
@@ -841,6 +949,13 @@ static void toggle_pause(void)
 	portENTER_CRITICAL(&state_lock);
 	if (player.playing) strcpy(player.status, paused ? "PAUSED" : "PLAYING");
 	portEXIT_CRITICAL(&state_lock);
+}
+
+// Leaves the tape screen, saving the volume if it changed there.
+static void close_cassette(void)
+{
+	cassette_view = false;
+	if (card_state == CARD_READY && atomic_load(&volume) != saved_volume) save_settings();
 }
 
 static void arrow(int left, int top, bool right, uint16_t color)
@@ -867,11 +982,17 @@ static void render_browser(void)
 	rect(0, 0, WIDTH, 43, INK);
 	text(12, 9, "TAPE LIBRARY", 2, WHITE, 24);
 	render_label();
-	const char *source = builtin_library ? "FLASH / TAP TZX CAS" : "SD / TAP TZX CAS";
-	text(308 - (int)strlen(source) * 6, 30, source, 1, WHITE, 19);
+	// The open folder replaces the format list, keeping the end of a long path.
+	char source[NAME_SIZE + 24];
+	snprintf(source, sizeof(source), "%s /%s", builtin_library ? "FLASH" : "SD",
+			 folder[0] ? folder : " TAP TZX CAS");
+	size_t source_length = strlen(source);
+	if (source_length > 19) memcpy(source + source_length - 19, "...", 3);
+	const char *shown = source + (source_length > 19 ? source_length - 19 : 0);
+	text(308 - (int)strlen(shown) * 6, 30, shown, 1, WHITE, 19);
 	if (!file_count) {
 		text(24, 83, "NO TAPE FILES", 2, INK, 23);
-		text(24, 116, "ROOT / *.TAP *.TZX *.CAS", 1, INK, 40);
+		text(24, 116, "*.TAP *.TZX *.CAS OR FOLDERS", 1, INK, 40);
 	}
 	for (unsigned row = 0; row < PAGE_ROWS; ++row) {
 		unsigned index = page * PAGE_ROWS + row;
@@ -879,9 +1000,11 @@ static void render_browser(void)
 		int top = 50 + row * 29;
 		bool active = selected == index;
 		rect(8, top, 304, 26, active ? INK : WHITE);
-		text(15, top + 9, files[index] + strlen(files[index]) - 3, 1, active ? GREEN : INK, 3);
+		bool subfolder = is_folder(files[index]);
 		size_t length = strlen(files[index]);
-		size_t name_length = length - 4;
+		const char *kind = !strcmp(files[index], "../") ? "UP" : subfolder ? "DIR" : files[index] + length - 3;
+		text(15, top + 9, kind, 1, active ? GREEN : subfolder ? MUTED : INK, 3);
+		size_t name_length = length - (subfolder ? 1 : 4);
 		char name[38];
 		size_t visible = name_length < 36 ? name_length : 36;
 		memcpy(name, files[index], visible);
@@ -986,15 +1109,31 @@ static void render_cassette(unsigned animation)
 		arrow(STOP_BUTTON_LEFT + 16, 216, true, GREEN);
 	}
 	text(STOP_BUTTON_LEFT + 34, 221, state.playing ? "STOP" : "REPLAY", 1, WHITE, 8);
+	// Volume in the column right of the photo: + on top, a level bar, then -.
+	unsigned level = atomic_load(&volume);
+	rect(VOLUME_LEFT, 20, 28, 30, INK);
+	rect(VOLUME_LEFT + 8, 34, 12, 3, WHITE);
+	rect(VOLUME_LEFT + 13, 29, 3, 12, WHITE);
+	for (unsigned step = 0; step < VOLUME_MAX; ++step) {
+		rect(VOLUME_LEFT + 6, 128 - step * 7, 16, 5, step < level ? GREEN : MUTED);
+	}
+	rect(VOLUME_LEFT, 138, 28, 30, INK);
+	rect(VOLUME_LEFT + 8, 152, 12, 3, WHITE);
+	text(VOLUME_LEFT + 5, 173, "VOL", 1, INK, 3);
 }
 
 static void handle_tap(int screen_x, int screen_y)
 {
 	if (cassette_view) {
 		player_state_t state = player_snapshot();
-		if (screen_y >= 208 && screen_x < PAUSE_BUTTON_LEFT) {
+		unsigned level = atomic_load(&volume);
+		if (screen_x >= VOLUME_LEFT - 4 && screen_y >= 14 && screen_y < 92) {
+			if (level < VOLUME_MAX) atomic_store(&volume, level + 1);
+		} else if (screen_x >= VOLUME_LEFT - 4 && screen_y >= 108 && screen_y < 184) {
+			if (level) atomic_store(&volume, level - 1);
+		} else if (screen_y >= 208 && screen_x < PAUSE_BUTTON_LEFT) {
 			atomic_store(&cancel_playback, true);
-			if (!state.playing) cassette_view = false;
+			if (!state.playing) close_cassette();
 		} else if (screen_y >= 208 && screen_x < STOP_BUTTON_LEFT) {
 			if (state.playing) toggle_pause();
 		} else if (screen_y >= 208) {
@@ -1010,11 +1149,16 @@ static void handle_tap(int screen_x, int screen_y)
 	if (screen_y >= 202) {
 		if (screen_x < 95 && page) --page;
 		else if (screen_x > 240 && (page + 1) * PAGE_ROWS < file_count) ++page;
-		else if (screen_x >= 95 && screen_x <= 240) scan_files();
+		else if (screen_x >= 95 && screen_x <= 240) {
+			show_busy("SCANNING FILES");
+			scan_files();
+		}
 		selected = page * PAGE_ROWS;
 	} else if (screen_y >= 50 && screen_y < 195) {
 		unsigned index = page * PAGE_ROWS + (screen_y - 50) / 29;
-		if (index < file_count) {
+		if (index < file_count && is_folder(files[index])) {
+			open_folder(files[index]);
+		} else if (index < file_count) {
 			selected = index;
 			// Each tape started from the library gets the next cassette photo.
 			select_cassette(tapes_played++ % CASSETTE_IMAGES);
@@ -1124,9 +1268,12 @@ static void update_card(void)
 	if (state == CARD_READY) {
 		builtin_library = false;
 		apply_card_calibration();
+		load_settings();
 	}
 	if (builtin_library) return;
+	if (state == CARD_READY) show_busy("READING SD CARD");
 	cassette_view = false;
+	folder[0] = 0;
 	scan_files();
 }
 
@@ -1142,12 +1289,18 @@ static void ui_task(void *argument)
 		int screen_x = 0;
 		int screen_y = 0;
 		bool touched = touch_position(&screen_x, &screen_y);
+		if (busy_shown) {
+			// A touch still held after a slow operation is not a new tap.
+			busy_shown = false;
+			touch_held = true;
+			last_draw = 0;
+		}
 		if (touched && !touch_held) {
 			if (cassette_view && screen_y >= 208 && screen_x < PAUSE_BUTTON_LEFT) return_to_files = true;
 			handle_tap(screen_x, screen_y);
 		}
 		if (return_to_files && !player_snapshot().playing) {
-			cassette_view = false;
+			close_cassette();
 			return_to_files = false;
 		}
 		touch_held = touched;
@@ -1212,7 +1365,10 @@ void app_main(void)
 	TickType_t elapsed = xTaskGetTickCount() - splash_shown;
 	if (elapsed < pdMS_TO_TICKS(SPLASH_MS)) vTaskDelay(pdMS_TO_TICKS(SPLASH_MS) - elapsed);
 	select_cassette(0);
-	if (card_state == CARD_READY) apply_card_calibration();
+	if (card_state == CARD_READY) {
+		apply_card_calibration();
+		load_settings();
+	}
 	scan_files();
 	ESP_ERROR_CHECK(xTaskCreatePinnedToCore(ui_task, "tape_ui", 6144, NULL, 3, NULL, 1) == pdPASS
 					? ESP_OK : ESP_ERR_NO_MEM);

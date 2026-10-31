@@ -1,0 +1,27 @@
+# Third-party code compiled into the firmware. ESP-IDF is a CMake/C framework with
+# no package manifest FOSSA can detect, so its parts are declared here.
+custom-dependencies:
+  - name: esp-idf
+    version: "5.4"
+    license: Apache-2.0
+    metadata:
+      homepage: https://github.com/espressif/esp-idf
+      description: Espressif IoT Development Framework (drivers, FreeRTOS, FATFS, VFS)
+  - name: cJSON
+    version: "1.7.18"
+    license: MIT
+    metadata:
+      homepage: https://github.com/DaveGamble/cJSON
+      description: JSON parser bundled with ESP-IDF (components/json)
+  - name: FatFs
+    version: R0.15
+    license: BSD-1-Clause
+    metadata:
+      homepage: http://elm-chan.org/fsw/ff/
+      description: FAT filesystem module bundled with ESP-IDF (components/fatfs)
+  - name: FreeRTOS-Kernel
+    version: "10.5.1"
+    license: MIT
+    metadata:
+      homepage: https://github.com/espressif/esp-idf/tree/master/components/freertos
+      description: RTOS kernel bundled with ESP-IDF

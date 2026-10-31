@@ -74,15 +74,22 @@ select `-O2` and a 240 MHz CPU, mainly to keep full-screen redraws fast.
 - `sdcard/` — sample TAP bundled into flash (the BUILT-IN TAPES library) and
   copied onto the simulator's microSD card.
 - `diagram.json`, `wokwi.toml` — Wokwi simulation setup (see above).
+- `docs/screenshots/` — README screenshots taken in Wokwi (`take-screenshot` on
+  `lcd1`); retake them when the screens they show change.
+- `LICENSE` (GPL-3.0-or-later), `.fossa.yml`, `fossa-deps.yml` — FOSSA finds no
+  package manifests in an ESP-IDF project, so third-party code linked into the
+  firmware is declared in `fossa-deps.yml`; update it (and README's Licence table)
+  when adding a component or moving ESP-IDF versions.
 - `main/cassette-tdk-d46.bin`, `main/cassette-sony-hf60.bin` — generated,
   committed: the playback screen's cassette photos plus 24 pre-rotated frames
   of each hub, embedded with `EMBED_FILES`. Made from `assets/*.jpg` by
   `tools/cassette_image.py` (README has the commands; the Sony source must be
   scaled to 1920 px first). Crop/hub constants live per photo in its `PHOTOS`
   table, measured on those exact files. The TDK photo is CC BY 3.0, credited in
-  README; the Sony photo's source/licence is not recorded yet.
+  README; the Sony photo is by Bruno Guerrero on Unsplash (Unsplash License).
 - `main/splash.bin` — generated, committed: the start-up splash icon (200×200,
-  white made transparent) from `assets/splash.jpeg`, same script and format with
+  white made transparent) from `assets/splash.jpeg` (AI-generated with Google's
+  Nano Banana, credited in README), same script and format with
   no hubs. `render_splash()` draws it with `V<PROJECT_VER> - APP_AUTHOR - <build
   year from esp_app_get_description()>`; `app_main` keeps it up for at least
   `SPLASH_MS` while mounting the SD card, then calls `select_cassette(0)` to put
@@ -103,7 +110,7 @@ DMA EOF interrupt push a stale descriptor address into the new channel's pool,
 which crashed `dac_continuous_write` on the second playback. Each playback ends
 by writing one silence buffer, since the output keeps its last samples once the
 DMA runs dry. The playback task reads
-`files[selected]` and `library_root` directly, so nothing may rescan or change
+`files[selected]`, `library_root` and `folder` directly, so nothing may rescan or change
 the selection while playing (the browser is only reachable once playback has
 stopped).
 
@@ -140,7 +147,8 @@ uppercased and anything else renders as `?`. Glyph cells are 6 px × scale wide.
 `ui_task`) and must match the coordinates used in `render_browser()` /
 `render_cassette()`. Change both together.
 
-**Audio** is 250 kHz 8-bit DAC on GPIO26; levels 48/208 for pulse edges, 128 for
+**Audio** is 250 kHz 8-bit DAC on GPIO26; pulse edges are 128 ± 127 × `volume` /
+`VOLUME_MAX` (the atomic `volume`, 0–10, read per pulse so it changes live), 128 for
 silence. `audio.remainder` carries fractional samples between pulses — keep
 that accumulation when touching timing. Only one TAP block is in RAM at a time.
 
@@ -153,8 +161,16 @@ board times out, Wokwi without a card answers garbage), UNSUPPORTED (anything
 else, or a volume that is not FAT16/FAT32) or READY; the first two show
 `render_card_screen()` unless `builtin_library` is set. To simulate an empty
 slot, remove the `sd1` part from a copy of `diagram.json` and pass it with
-`wokwi-cli --diagram-file`. The built-in library mounts read-only at `/flash`. Only
-regular, non-dot `.tap`, `.tzx` and `.cas` files in the root are listed (max 96, case-insensitive sort).
+`wokwi-cli --diagram-file`. The built-in library mounts read-only at `/flash`. The
+browser lists one folder at a time: `folder` is the path below `library_root`
+("" at the root; `entry_path()` joins them). `files[]` holds folders with a
+trailing `/` (`is_folder()`) and `"../"` first inside a sub-folder, then folders,
+then regular, non-dot `.tap`, `.tzx` and `.cas` files (max 96, case-insensitive
+sort). `update_card()` and `open_builtin_library()` reset `folder` to the root.
+Slow work in the UI task (scans, card change) first calls `show_busy()`, which
+flushes a pane over the current frame and sets `busy_shown`; `ui_task` then
+treats any touch still down as held and forces a full redraw. Don't call it from
+`app_main` (the splash palette is gone by then).
 `mount_sd()` also reads the volume label into `card_label` with `f_getlabel`,
 which needs `CONFIG_FATFS_USE_LABEL=y` (in `sdkconfig.defaults`);
 `render_label()` shows it under the header title.
@@ -162,6 +178,11 @@ which needs `CONFIG_FATFS_USE_LABEL=y` (in `sdkconfig.defaults`);
 runs whenever a card becomes READY (startup or `update_card()`), loading the file
 or running `calibrate_touch()` (XPT2046 only) and saving it. No card means no
 calibration screen; touch keeps the default (or last applied) mapping.
+`load_settings()` runs right after it and reads `settings.json` (`volume`), writing
+the default (`VOLUME_DEFAULT`, 5) when the file is missing or invalid. The volume
+buttons sit right of the photo (`VOLUME_LEFT`, hit areas in `handle_tap()`);
+`close_cassette()` saves the file when the tape screen closes and the volume
+differs from `saved_volume`.
 
 ## Style
 
